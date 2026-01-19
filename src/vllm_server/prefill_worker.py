@@ -207,57 +207,35 @@ class PrefillWorker:
                     stop=request.stop_sequences,
                 )
                 
-                # Use add_request API for better compatibility with vLLM versions
                 # Generate a unique request ID for this prefill operation
                 internal_request_id = f"prefill_{request.request_id}_{uuid.uuid4().hex[:8]}"
                 
+                prefill_tokens = 0
+                
                 try:
-                    # Try the newer API first (vLLM >= 0.4.0)
+                    # Use positional arguments as per vLLM documentation
+                    # generate(prompt, sampling_params, request_id, ...)
                     results_generator = self.engine.generate(
-                        prompt=request.prompt,
-                        sampling_params=sampling_params,
-                        request_id=internal_request_id
+                        request.prompt,           # positional: prompt
+                        sampling_params,          # positional: sampling_params
+                        internal_request_id       # positional: request_id
                     )
                     
-                    prefill_tokens = 0
                     async for result in results_generator:
                         # Get prompt token count from the result
-                        if hasattr(result, 'prompt_token_ids'):
+                        if hasattr(result, 'prompt_token_ids') and result.prompt_token_ids:
                             prefill_tokens = len(result.prompt_token_ids)
                         elif hasattr(result, 'outputs') and len(result.outputs) > 0:
                             # Try to get from outputs
                             output = result.outputs[0]
-                            if hasattr(output, 'prompt_token_ids'):
-                                prefill_tokens = len(output.prompt_token_ids)
-                            elif hasattr(result, 'prompt') and result.prompt:
-                                # Estimate from prompt length
-                                prefill_tokens = len(request.prompt.split()) * 2
+                            if hasattr(output, 'token_ids'):
+                                # At least we processed something
+                                prefill_tokens = max(prefill_tokens, 1)
                         break  # Only need first result for prefill
                         
-                except TypeError as e:
-                    # Fallback for older vLLM API
-                    logger.warning(f"Using fallback API due to: {e}")
-                    
-                    # Try alternative method
-                    from vllm import RequestOutput
-                    
-                    # Add request manually
-                    await self.engine.add_request(
-                        request_id=internal_request_id,
-                        prompt=request.prompt,
-                        sampling_params=sampling_params
-                    )
-                    
-                    # Get results
-                    prefill_tokens = 0
-                    async for output in self.engine.generate(None, None, internal_request_id):
-                        if hasattr(output, 'prompt_token_ids'):
-                            prefill_tokens = len(output.prompt_token_ids)
-                        break
-                
                 except Exception as e:
-                    logger.error(f"vLLM generate error: {e}")
-                    # Fallback to estimation
+                    logger.error(f"vLLM generate error: {e}", exc_info=True)
+                    # Fallback to estimation based on prompt length
                     prefill_tokens = len(request.prompt.split()) * 2
                 
                 # Store KV cache metadata
@@ -311,21 +289,11 @@ class PrefillWorker:
         return self.kv_cache_store[kv_cache_id]
     
     async def release_kv_cache(self, kv_cache_id: str) -> Dict[str, str]:
-        """Release KV cache after decode completion."""
+        """Release KV cache after decode is complete."""
         if kv_cache_id in self.kv_cache_store:
-            # Try to abort the request in vLLM engine if it exists
-            cache_data = self.kv_cache_store[kv_cache_id]
-            if VLLM_AVAILABLE and self.engine is not None:
-                internal_id = cache_data.get("internal_request_id")
-                if internal_id:
-                    try:
-                        await self.engine.abort(internal_id)
-                    except Exception as e:
-                        logger.debug(f"Could not abort request {internal_id}: {e}")
-            
             del self.kv_cache_store[kv_cache_id]
             return {"status": "released", "kv_cache_id": kv_cache_id}
-        raise HTTPException(status_code=404, detail="KV cache not found")
+        return {"status": "not_found", "kv_cache_id": kv_cache_id}
     
     def run(self):
         """Run the prefill worker server."""

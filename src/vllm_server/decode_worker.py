@@ -266,11 +266,12 @@ class DecodeWorker:
                 generated_tokens = 0
                 
                 try:
-                    # Try the newer API first (vLLM >= 0.4.0)
+                    # Use positional arguments as per vLLM documentation
+                    # generate(prompt, sampling_params, request_id, ...)
                     results_generator = self.engine.generate(
-                        prompt=prompt,
-                        sampling_params=sampling_params,
-                        request_id=internal_request_id
+                        prompt,                   # positional: prompt
+                        sampling_params,          # positional: sampling_params
+                        internal_request_id       # positional: request_id
                     )
                     
                     async for result in results_generator:
@@ -278,28 +279,6 @@ class DecodeWorker:
                             generated_text = result.outputs[0].text
                             generated_tokens = len(result.outputs[0].token_ids)
                             
-                except TypeError as e:
-                    # Fallback for older vLLM API
-                    logger.warning(f"Using fallback API due to: {e}")
-                    
-                    try:
-                        # Try alternative method with add_request
-                        await self.engine.add_request(
-                            request_id=internal_request_id,
-                            prompt=prompt,
-                            sampling_params=sampling_params
-                        )
-                        
-                        async for output in self.engine.generate(None, None, internal_request_id):
-                            if output.outputs:
-                                generated_text = output.outputs[0].text
-                                generated_tokens = len(output.outputs[0].token_ids)
-                    except Exception as inner_e:
-                        logger.error(f"Fallback API also failed: {inner_e}")
-                        # Use mock response as last resort
-                        generated_text = f"[Generation failed: {inner_e}]"
-                        generated_tokens = 0
-                        
                 except Exception as e:
                     logger.error(f"vLLM generate error: {e}", exc_info=True)
                     generated_text = f"[Generation error: {e}]"
@@ -364,11 +343,11 @@ class DecodeWorker:
                 internal_request_id = f"stream_{request.request_id}_{uuid.uuid4().hex[:8]}"
                 
                 try:
-                    # Try the newer API first (vLLM >= 0.4.0)
+                    # Use positional arguments as per vLLM documentation
                     results_generator = self.engine.generate(
-                        prompt=prompt,
-                        sampling_params=sampling_params,
-                        request_id=internal_request_id
+                        prompt,                   # positional: prompt
+                        sampling_params,          # positional: sampling_params
+                        internal_request_id       # positional: request_id
                     )
                     
                     previous_text = ""
@@ -384,14 +363,8 @@ class DecodeWorker:
                             if result.outputs[0].finish_reason:
                                 yield f"data: [DONE]\n\n"
                                 
-                except TypeError as e:
-                    logger.warning(f"Stream using fallback due to: {e}")
-                    # Fallback: yield error message
-                    yield f"data: [ERROR] API compatibility issue: {e}\n\n"
-                    yield f"data: [DONE]\n\n"
-                    
                 except Exception as e:
-                    logger.error(f"Stream generate error: {e}")
+                    logger.error(f"Stream generate error: {e}", exc_info=True)
                     yield f"data: [ERROR] {str(e)}\n\n"
                     yield f"data: [DONE]\n\n"
             else:
