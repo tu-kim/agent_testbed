@@ -46,7 +46,7 @@ class IRCoTResult:
     total_time_ms: float
 
 
-# ============== ReAct-Style Prompt Templates ==============
+# ============== ReAct-Style Prompt Templates with Few-Shot Examples ==============
 
 REACT_SYSTEM_PROMPT = """You are a helpful assistant that answers multi-hop questions by reasoning step-by-step.
 
@@ -61,7 +61,67 @@ Rules:
 2. If you need more information to answer the question, use [SEARCH: <specific query>]
 3. If you have enough information, use [ANSWER: <your final answer>]
 4. Always explain your reasoning in the Thought section before taking an action
-5. Be concise but thorough in your reasoning"""
+5. Be concise but thorough in your reasoning
+
+Here are some examples of how to reason through multi-hop questions:
+
+===== Example 1 =====
+Question: Who was the director of the movie that featured the song "My Heart Will Go On"?
+
+Retrieval 1:
+  [1] Titanic (1997 film): Titanic is a 1997 American epic romance and disaster film directed by James Cameron. The film features the song "My Heart Will Go On" performed by Celine Dion.
+  [2] My Heart Will Go On: "My Heart Will Go On" is a song recorded by Canadian singer Celine Dion. It serves as the main theme song to the 1997 film Titanic.
+
+Thought 1: The retrieved documents clearly state that "My Heart Will Go On" was featured in the 1997 film Titanic, and that Titanic was directed by James Cameron. I have enough information to answer the question.
+Action 1: [ANSWER: James Cameron]
+
+===== Example 2 =====
+Question: What is the capital of the country where the Eiffel Tower is located?
+
+Retrieval 1:
+  [1] Eiffel Tower: The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France. It is named after the engineer Gustave Eiffel.
+  [2] Paris: Paris is the capital and most populous city of France, with an estimated population of 2,161,000 residents.
+
+Thought 1: From the retrieved documents, I can see that the Eiffel Tower is located in Paris, France. The documents also confirm that Paris is the capital of France. I have all the information needed to answer.
+Action 1: [ANSWER: Paris]
+
+===== Example 3 =====
+Question: What university did the founder of Microsoft graduate from?
+
+Retrieval 1:
+  [1] Microsoft: Microsoft Corporation is an American multinational technology corporation. It was founded by Bill Gates and Paul Allen on April 4, 1975.
+  [2] Bill Gates: William Henry Gates III (born October 28, 1955) is an American business magnate, software developer, and philanthropist. He is best known as the co-founder of Microsoft Corporation.
+
+Thought 1: I found that Microsoft was founded by Bill Gates and Paul Allen. However, I don't have information about which university Bill Gates graduated from. I need to search for more specific information about Bill Gates' education.
+Action 1: [SEARCH: Bill Gates education university]
+
+Retrieval 2:
+  [1] Bill Gates education: Bill Gates attended Harvard University in 1973 but dropped out two years later to start Microsoft with Paul Allen. He was awarded an honorary degree from Harvard in 2007.
+  [2] Harvard University: Harvard University is a private Ivy League research university in Cambridge, Massachusetts.
+
+Thought 2: Now I have the information. Bill Gates attended Harvard University, though he dropped out before graduating. Since the question asks about the university the founder attended (not necessarily graduated from), Harvard University is the answer.
+Action 2: [ANSWER: Harvard University]
+
+===== Example 4 =====
+Question: In which year was the company that created the iPhone founded?
+
+Retrieval 1:
+  [1] iPhone: The iPhone is a line of smartphones designed and marketed by Apple Inc. The first iPhone was announced by Steve Jobs on January 9, 2007.
+  [2] Smartphone history: The first smartphone was IBM Simon, introduced in 1992.
+
+Thought 1: I found that the iPhone was created by Apple Inc., but I don't have information about when Apple was founded. I need to search for Apple's founding year.
+Action 1: [SEARCH: Apple Inc founding year history]
+
+Retrieval 2:
+  [1] Apple Inc.: Apple Inc. is an American multinational technology company. It was founded by Steve Jobs, Steve Wozniak, and Ronald Wayne on April 1, 1976.
+  [2] Steve Jobs: Steve Jobs co-founded Apple Computer in 1976 with Steve Wozniak and Ronald Wayne.
+
+Thought 2: The documents clearly state that Apple Inc. was founded on April 1, 1976. Since Apple created the iPhone, the answer to the question is 1976.
+Action 2: [ANSWER: 1976]
+
+===== End of Examples =====
+
+Now, apply this reasoning approach to answer the following question:"""
 
 
 class IRCoTRAGPipeline:
