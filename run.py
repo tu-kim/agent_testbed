@@ -2,8 +2,11 @@
 """
 CLI Runner for Multi-hop RAG with IRCoT
 
-Provides command-line interface for running different components
-of the RAG system.
+Commands:
+- index: Build FAISS index from HotpotQA corpus
+- server: Run the RAG server (connects to external vLLM PD server)
+- profile: Run query generator profiling with Poisson arrivals
+- query: Run a single query
 """
 
 import argparse
@@ -27,80 +30,21 @@ logger = logging.getLogger(__name__)
 def run_server(args):
     """Run the main RAG server."""
     os.environ.setdefault("LLM_ENDPOINT", args.llm_endpoint)
+    os.environ.setdefault("LLM_MODEL", args.llm_model)
     os.environ.setdefault("FAISS_ALGORITHM", args.algorithm)
     os.environ.setdefault("CACHE_DIR", args.cache_dir)
-    os.environ.setdefault("MODEL_NAME", args.model_name)
     
     from src.main import run_server as start_server
     start_server(host=args.host, port=args.port, reload=args.reload)
 
 
-def run_proxy(args):
-    """Run the vLLM proxy server."""
-    from src.vllm_server.proxy_server import create_proxy_server
-    
-    prefill_workers = []
-    for addr in args.prefill_workers:
-        host, port = addr.split(":")
-        prefill_workers.append({"host": host, "port": int(port)})
-    
-    decode_workers = []
-    for addr in args.decode_workers:
-        host, port = addr.split(":")
-        decode_workers.append({"host": host, "port": int(port)})
-    
-    server = create_proxy_server(
-        host=args.host,
-        port=args.port,
-        prefill_workers=prefill_workers,
-        decode_workers=decode_workers,
-        model_name=args.model_name
-    )
-    server.run()
-
-
-def run_prefill(args):
-    """Run the vLLM prefill worker."""
-    from src.vllm_server.prefill_worker import create_prefill_worker
-    
-    worker = create_prefill_worker(
-        model_name=args.model,
-        host=args.host,
-        port=args.port,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        trust_remote_code=args.trust_remote_code,
-        tokenizer=args.tokenizer
-    )
-    
-    asyncio.run(worker.initialize())
-    worker.run()
-
-
-def run_decode(args):
-    """Run the vLLM decode worker."""
-    from src.vllm_server.decode_worker import create_decode_worker
-    
-    worker = create_decode_worker(
-        model_name=args.model,
-        host=args.host,
-        port=args.port,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        trust_remote_code=args.trust_remote_code,
-        tokenizer=args.tokenizer
-    )
-    
-    asyncio.run(worker.initialize())
-    worker.run()
-
-
 def run_index(args):
-    """Index documents into FAISS (C4 corpus only)."""
+    """Index documents from HotpotQA corpus into FAISS."""
     from src.retrieval.faiss_retriever import create_retriever
     from src.retrieval.dataset_loader import create_dataset_manager
     
-    logger.info(f"Creating retriever with algorithm: {args.algorithm}")
+    logger.info(f"Building index from HotpotQA {args.corpus_split} split")
+    logger.info(f"Algorithm: {args.algorithm}")
     logger.info(f"Device: {args.device}, Batch size: {args.batch_size}")
     
     retriever = create_retriever(
@@ -117,23 +61,19 @@ def run_index(args):
             logger.info("Use --force to rebuild index")
             return
     
-    # Load C4 corpus from local directory
-    if not args.corpus_dir:
-        logger.error("--corpus-dir is required. Please specify the local directory containing C4 dataset.")
-        sys.exit(1)
-    
-    logger.info(f"Loading C4 corpus from: {args.corpus_dir}")
+    # Load HotpotQA corpus
+    logger.info(f"Loading HotpotQA corpus from {args.corpus_split} split...")
     manager = create_dataset_manager(
-        corpus_local_dir=args.corpus_dir,
-        num_workers=args.num_workers
+        corpus_split=args.corpus_split,
+        eval_split=args.eval_split
     )
     corpus = manager.load_corpus()
     
     if not corpus:
-        logger.error("No documents loaded from corpus directory")
+        logger.error("No documents loaded from HotpotQA")
         sys.exit(1)
     
-    logger.info(f"Loaded {len(corpus)} documents from C4 corpus")
+    logger.info(f"Loaded {len(corpus)} documents from HotpotQA")
     
     # Index documents
     logger.info(f"Indexing {len(corpus)} documents...")
@@ -146,29 +86,36 @@ def run_index(args):
 
 
 def run_profile(args):
-    """Run performance profiling using HotpotQA questions."""
-    from src.frontend.profiler import run_profiling
+    """Run query generator profiling with Poisson arrivals."""
+    from src.frontend.query_generator import run_profiling
     from src.retrieval.dataset_loader import create_dataset_manager
     
+    logger.info(f"Loading HotpotQA questions from {args.eval_split} split...")
+    
     # Load questions from HotpotQA
-    logger.info("Loading HotpotQA questions for profiling...")
-    manager = create_dataset_manager()
+    manager = create_dataset_manager(
+        eval_split=args.eval_split
+    )
+    questions = manager.load_queries(max_samples=args.max_queries)
     
-    total_needed = args.num_queries + args.warmup_queries + 10
-    eval_data = manager.get_evaluation_data(num_samples=total_needed)
-    questions = [item["question"] for item in eval_data]
+    if not questions:
+        logger.error("No questions loaded from HotpotQA")
+        sys.exit(1)
     
-    if len(questions) < args.num_queries:
-        logger.warning(f"Only {len(questions)} questions available")
-    
-    logger.info(f"Loaded {len(questions)} HotpotQA questions")
+    logger.info(f"Loaded {len(questions)} questions")
+    logger.info(f"Profiling endpoint: {args.endpoint}")
+    logger.info(f"QPS range: {args.start_qps} -> {args.end_qps} (step: {args.qps_step})")
+    logger.info(f"Stage duration: {args.stage_duration}s")
     
     # Run profiling
     asyncio.run(run_profiling(
         endpoint=args.endpoint,
         questions=questions,
-        num_queries=args.num_queries,
-        warmup_queries=args.warmup_queries,
+        start_qps=args.start_qps,
+        end_qps=args.end_qps,
+        qps_step=args.qps_step,
+        stage_duration=args.stage_duration,
+        seed=args.seed,
         output_file=args.output
     ))
 
@@ -208,93 +155,101 @@ def run_query(args):
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-hop RAG with IRCoT CLI",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Build index from HotpotQA train split
+  python run.py index --corpus-split train --algorithm hnsw
+
+  # Run RAG server (assumes external vLLM PD server at localhost:8000)
+  python run.py server --llm-endpoint http://localhost:8000 --port 8080
+
+  # Run profiling with Poisson arrivals (QPS 1 -> 10)
+  python run.py profile --endpoint http://localhost:8080 --start-qps 1 --end-qps 10
+
+  # Run a single query
+  python run.py query "What is the capital of France?"
+"""
     )
     
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
     # Server command
     server_parser = subparsers.add_parser("server", help="Run the RAG server")
-    server_parser.add_argument("--host", type=str, default="0.0.0.0")
+    server_parser.add_argument("--host", type=str, default="0.0.0.0",
+                               help="Server host (default: 0.0.0.0)")
     server_parser.add_argument("--port", type=int, default=8080,
-                               help="Port for RAG server (default: 8080)")
+                               help="Server port (default: 8080)")
     server_parser.add_argument("--llm-endpoint", type=str, default="http://localhost:8000",
-                               help="LLM server endpoint (default: http://localhost:8000)")
-    server_parser.add_argument("--algorithm", type=str, default="hnsw", choices=["hnsw", "ivf", "flat"])
-    server_parser.add_argument("--cache-dir", type=str, default="./cache/faiss_index")
-    server_parser.add_argument("--model-name", type=str, default="meta-llama/Llama-2-7b-chat-hf",
-                               help="Model name or local path")
-    server_parser.add_argument("--reload", action="store_true")
+                               help="External vLLM PD server endpoint (default: http://localhost:8000)")
+    server_parser.add_argument("--llm-model", type=str, default="meta-llama/Llama-2-7b-chat-hf",
+                               help="LLM model name for API calls")
+    server_parser.add_argument("--algorithm", type=str, default="hnsw", 
+                               choices=["hnsw", "ivf", "flat"],
+                               help="FAISS algorithm (default: hnsw)")
+    server_parser.add_argument("--cache-dir", type=str, default="./cache/faiss_index",
+                               help="Directory containing FAISS index")
+    server_parser.add_argument("--reload", action="store_true",
+                               help="Enable auto-reload for development")
     server_parser.set_defaults(func=run_server)
     
-    # Proxy command
-    proxy_parser = subparsers.add_parser("proxy", help="Run the vLLM proxy server")
-    proxy_parser.add_argument("--host", type=str, default="0.0.0.0")
-    proxy_parser.add_argument("--port", type=int, default=8000,
-                              help="Port for proxy server (default: 8000)")
-    proxy_parser.add_argument("--prefill-workers", type=str, nargs="+", default=["localhost:8001"])
-    proxy_parser.add_argument("--decode-workers", type=str, nargs="+", default=["localhost:8002"])
-    proxy_parser.add_argument("--model-name", type=str, default="meta-llama/Llama-2-7b-chat-hf",
-                              help="Model name or local path")
-    proxy_parser.set_defaults(func=run_proxy)
-    
-    # Prefill worker command
-    prefill_parser = subparsers.add_parser("prefill", help="Run the vLLM prefill worker")
-    prefill_parser.add_argument("--host", type=str, default="0.0.0.0")
-    prefill_parser.add_argument("--port", type=int, default=8001)
-    prefill_parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-chat-hf",
-                                help="Model name (HuggingFace ID) or local directory path")
-    prefill_parser.add_argument("--tokenizer", type=str, default=None,
-                                help="Tokenizer path (optional, defaults to model path)")
-    prefill_parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    prefill_parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    prefill_parser.add_argument("--trust-remote-code", action="store_true", default=True)
-    prefill_parser.set_defaults(func=run_prefill)
-    
-    # Decode worker command
-    decode_parser = subparsers.add_parser("decode", help="Run the vLLM decode worker")
-    decode_parser.add_argument("--host", type=str, default="0.0.0.0")
-    decode_parser.add_argument("--port", type=int, default=8002)
-    decode_parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-chat-hf",
-                               help="Model name (HuggingFace ID) or local directory path")
-    decode_parser.add_argument("--tokenizer", type=str, default=None,
-                               help="Tokenizer path (optional, defaults to model path)")
-    decode_parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    decode_parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    decode_parser.add_argument("--trust-remote-code", action="store_true", default=True)
-    decode_parser.set_defaults(func=run_decode)
-    
-    # Index command (C4 corpus only)
-    index_parser = subparsers.add_parser("index", help="Index C4 corpus into FAISS")
-    index_parser.add_argument("--corpus-dir", type=str, required=True,
-                              help="Local directory path containing C4 dataset (required)")
-    index_parser.add_argument("--algorithm", type=str, default="hnsw", choices=["hnsw", "ivf", "flat"])
-    index_parser.add_argument("--cache-dir", type=str, default="./cache/faiss_index")
-    index_parser.add_argument("--force", action="store_true", help="Force rebuild index")
-    index_parser.add_argument("--device", type=str, default="cuda", choices=["auto", "cuda", "cpu"],
-                              help="Device for embedding model (default: cuda)")
+    # Index command (HotpotQA corpus)
+    index_parser = subparsers.add_parser("index", help="Build FAISS index from HotpotQA")
+    index_parser.add_argument("--corpus-split", type=str, default="train",
+                              choices=["train", "validation"],
+                              help="HotpotQA split for corpus (default: train)")
+    index_parser.add_argument("--eval-split", type=str, default="validation",
+                              choices=["train", "validation"],
+                              help="HotpotQA split for evaluation (default: validation)")
+    index_parser.add_argument("--algorithm", type=str, default="hnsw", 
+                              choices=["hnsw", "ivf", "flat"],
+                              help="FAISS algorithm (default: hnsw)")
+    index_parser.add_argument("--cache-dir", type=str, default="./cache/faiss_index",
+                              help="Directory to save index")
+    index_parser.add_argument("--force", action="store_true", 
+                              help="Force rebuild index")
+    index_parser.add_argument("--device", type=str, default="cuda", 
+                              choices=["auto", "cuda", "cpu"],
+                              help="Device for embedding (default: cuda)")
     index_parser.add_argument("--batch-size", type=int, default=256,
                               help="Batch size for encoding (default: 256)")
-    index_parser.add_argument("--num-workers", type=int, default=os.cpu_count() or 4,
-                              help="Number of parallel workers for loading JSON files")
     index_parser.set_defaults(func=run_index)
     
-    # Profile command (HotpotQA questions)
-    profile_parser = subparsers.add_parser("profile", help="Run performance profiling with HotpotQA")
+    # Profile command (Query Generator with Poisson arrivals)
+    profile_parser = subparsers.add_parser("profile", 
+                                           help="Run query generator profiling with Poisson arrivals")
     profile_parser.add_argument("--endpoint", type=str, default="http://localhost:8080",
                                 help="RAG server endpoint (default: http://localhost:8080)")
-    profile_parser.add_argument("--num-queries", type=int, default=10)
-    profile_parser.add_argument("--warmup-queries", type=int, default=2)
-    profile_parser.add_argument("--output", type=str, default=None)
+    profile_parser.add_argument("--eval-split", type=str, default="validation",
+                                choices=["train", "validation"],
+                                help="HotpotQA split for queries (default: validation)")
+    profile_parser.add_argument("--start-qps", type=float, default=1.0,
+                                help="Starting QPS (default: 1.0)")
+    profile_parser.add_argument("--end-qps", type=float, default=10.0,
+                                help="Ending QPS (default: 10.0)")
+    profile_parser.add_argument("--qps-step", type=float, default=1.0,
+                                help="QPS increment per stage (default: 1.0)")
+    profile_parser.add_argument("--stage-duration", type=float, default=30.0,
+                                help="Duration of each QPS stage in seconds (default: 30)")
+    profile_parser.add_argument("--max-queries", type=int, default=None,
+                                help="Maximum queries to load from dataset")
+    profile_parser.add_argument("--seed", type=int, default=42,
+                                help="Random seed for reproducibility (default: 42)")
+    profile_parser.add_argument("--output", type=str, default=None,
+                                help="Output JSON file for profiling results")
     profile_parser.set_defaults(func=run_profile)
     
     # Query command
     query_parser = subparsers.add_parser("query", help="Run a single query")
     query_parser.add_argument("question", type=str, help="Question to ask")
-    query_parser.add_argument("--endpoint", type=str, default="http://localhost:8080")
-    query_parser.add_argument("--top-k", type=int, default=5)
-    query_parser.add_argument("--max-iterations", type=int, default=3)
-    query_parser.add_argument("--verbose", "-v", action="store_true")
+    query_parser.add_argument("--endpoint", type=str, default="http://localhost:8080",
+                              help="RAG server endpoint")
+    query_parser.add_argument("--top-k", type=int, default=5,
+                              help="Number of documents to retrieve")
+    query_parser.add_argument("--max-iterations", type=int, default=3,
+                              help="Maximum IRCoT iterations")
+    query_parser.add_argument("--verbose", "-v", action="store_true",
+                              help="Show reasoning steps")
     query_parser.set_defaults(func=run_query)
     
     args = parser.parse_args()
