@@ -66,7 +66,6 @@ class HotpotQACorpusLoader:
             self.config.qa_name,
             name=self.config.qa_subset,
             split=split,
-            trust_remote_code=True
         )
         
         documents = []
@@ -138,7 +137,6 @@ class HotpotQAQueryLoader:
             self.config.qa_name,
             name=self.config.qa_subset,
             split=split,
-            trust_remote_code=True
         )
         
         questions = []

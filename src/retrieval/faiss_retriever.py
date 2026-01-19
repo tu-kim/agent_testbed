@@ -54,7 +54,7 @@ class IVFConfig:
 @dataclass
 class FAISSRetrieverConfig:
     """Configuration for FAISS retriever."""
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
     cache_dir: str = "./cache/faiss_index"
     algorithm: IndexAlgorithm = IndexAlgorithm.HNSW
     hnsw_config: HNSWConfig = field(default_factory=HNSWConfig)
