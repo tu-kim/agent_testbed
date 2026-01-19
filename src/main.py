@@ -38,10 +38,7 @@ state = {
         "llm_endpoint": os.getenv("LLM_ENDPOINT", "http://localhost:8000"),
         "cache_dir": os.getenv("CACHE_DIR", "./cache/faiss_index"),
         "algorithm": os.getenv("FAISS_ALGORITHM", "hnsw"),
-        "model_name": os.getenv("MODEL_NAME", "meta-llama/Llama-2-7b-chat-hf"),
-        "tiered": os.getenv("TIERED_STORAGE", "false").lower() == "true",
-        "ram_capacity": int(os.getenv("RAM_CAPACITY", "100000")),
-        "ssd_dir": os.getenv("SSD_DIR", "./cache/ssd_index")
+        "model_name": os.getenv("MODEL_NAME", "meta-llama/Llama-2-7b-chat-hf")
     }
 }
 
@@ -66,17 +63,11 @@ async def startup_event():
     """Initialize components on startup."""
     logger.info("Initializing RAG components...")
     
-    # Initialize retriever with tiered storage support
+    # Initialize retriever
     state["retriever"] = create_retriever(
         algorithm=state["config"]["algorithm"],
-        cache_dir=state["config"]["cache_dir"],
-        tiered=state["config"]["tiered"],
-        ram_capacity=state["config"]["ram_capacity"],
-        ssd_dir=state["config"]["ssd_dir"]
+        cache_dir=state["config"]["cache_dir"]
     )
-    
-    if state["config"]["tiered"]:
-        logger.info(f"Tiered storage enabled: RAM={state['config']['ram_capacity']}, SSD={state['config']['ssd_dir']}")
     
     # Load index if exists
     if state["retriever"].load():

@@ -9,7 +9,8 @@ import os
 import logging
 import json
 import glob
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from multiprocessing import get_context
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import hashlib
@@ -43,30 +44,29 @@ class DatasetConfig:
     num_workers: int = os.cpu_count() or 4
 
 
-def _process_single_json_file(args: Tuple[str, int, int]) -> List[Dict[str, Any]]:
+# Worker function must be at module level for multiprocessing to work
+def process_json_file(file_path: str, min_len: int = 100, max_len: int = 10000) -> List[Dict[str, Any]]:
     """
-    Worker function to process a single JSON/JSONL file.
-    This function runs in a separate process.
+    Process a single JSON/JSONL file and extract documents.
+    This function is called by worker processes.
     """
-    file_path, min_len, max_len = args
     docs = []
     
     try:
-        file_size = os.path.getsize(file_path)
-        
         with open(file_path, 'r', encoding='utf-8') as f:
-            # Check if it's JSON array or JSONL
-            first_char = f.read(1)
-            f.seek(0)
+            content = f.read().strip()
             
-            if first_char == '[':
-                # JSON array - load entire file
-                data = json.load(f)
-                items = data if isinstance(data, list) else [data]
+            if not content:
+                return docs
+            
+            # Determine format and parse
+            if content.startswith('['):
+                # JSON array
+                items = json.loads(content)
             else:
-                # JSONL (one JSON object per line) - process line by line
+                # JSONL format
                 items = []
-                for line in f:
+                for line in content.split('\n'):
                     line = line.strip()
                     if line:
                         try:
@@ -74,11 +74,15 @@ def _process_single_json_file(args: Tuple[str, int, int]) -> List[Dict[str, Any]
                         except json.JSONDecodeError:
                             continue
             
+            # Process items
             for item in items:
                 text = item.get("text", "")
-                if len(text) < min_len:
+                text_len = len(text)
+                
+                if text_len < min_len:
                     continue
-                if len(text) > max_len:
+                
+                if text_len > max_len:
                     text = text[:max_len]
                 
                 docs.append({
@@ -88,25 +92,15 @@ def _process_single_json_file(args: Tuple[str, int, int]) -> List[Dict[str, Any]
                 })
                 
     except Exception as e:
-        # Log error but don't crash the worker
-        print(f"[Worker] Error processing {file_path}: {e}")
+        print(f"[Worker PID {os.getpid()}] Error processing {file_path}: {e}")
     
     return docs
 
 
-def _process_file_batch(args: Tuple[List[str], int, int]) -> List[Dict[str, Any]]:
-    """
-    Process a batch of files in a single worker.
-    More efficient for many small files.
-    """
-    file_paths, min_len, max_len = args
-    all_docs = []
-    
-    for file_path in file_paths:
-        docs = _process_single_json_file((file_path, min_len, max_len))
-        all_docs.extend(docs)
-    
-    return all_docs
+def _worker_init():
+    """Worker initializer to set process name for debugging."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 class C4CorpusLoader:
@@ -122,99 +116,70 @@ class C4CorpusLoader:
         if not os.path.exists(local_dir):
             raise FileNotFoundError(f"Local directory not found: {local_dir}")
         
-        # Find all JSON files (including .json and .jsonl)
+        # Find all JSON files
         json_files = []
-        for pattern in ["*.json", "*.jsonl"]:
-            json_files.extend(glob.glob(os.path.join(local_dir, pattern)))
-            json_files.extend(glob.glob(os.path.join(local_dir, "**", pattern), recursive=True))
+        for ext in ["*.json", "*.jsonl"]:
+            json_files.extend(glob.glob(os.path.join(local_dir, ext)))
+            json_files.extend(glob.glob(os.path.join(local_dir, "**", ext), recursive=True))
         
-        # Remove duplicates and sort for consistent ordering
         json_files = sorted(list(set(json_files)))
         
         if not json_files:
             logger.error("No JSON files found in the directory")
             return []
 
-        num_workers = self.config.num_workers
+        num_workers = min(self.config.num_workers, len(json_files))
         logger.info(f"Found {len(json_files)} JSON files")
-        logger.info(f"Using {num_workers} parallel workers")
+        logger.info(f"Starting {num_workers} parallel workers...")
         
-        # Calculate total file size for progress estimation
+        # Calculate total size
         total_size = sum(os.path.getsize(f) for f in json_files)
         logger.info(f"Total data size: {total_size / (1024**3):.2f} GB")
         
         start_time = time.time()
         all_documents = []
         seen_hashes = set()
-        processed_files = 0
         
-        # Determine processing strategy based on file count
-        if len(json_files) > num_workers * 10:
-            # Many files: batch them for each worker
-            batch_size = max(1, len(json_files) // num_workers)
-            file_batches = [
-                json_files[i:i + batch_size] 
-                for i in range(0, len(json_files), batch_size)
-            ]
+        # Prepare arguments for workers
+        min_len = self.config.min_text_length
+        max_len = self.config.max_text_length
+        
+        # Use 'spawn' context for better compatibility
+        ctx = get_context('spawn')
+        
+        with ctx.Pool(processes=num_workers, initializer=_worker_init) as pool:
+            # Create tasks
+            tasks = [(f, min_len, max_len) for f in json_files]
             
-            logger.info(f"Processing in {len(file_batches)} batches (batch size: ~{batch_size} files)")
+            # Use starmap_async for parallel execution
+            logger.info("Submitting tasks to worker pool...")
+            async_result = pool.starmap_async(process_json_file, tasks)
             
-            batch_args = [
-                (batch, self.config.min_text_length, self.config.max_text_length)
-                for batch in file_batches
-            ]
+            # Wait with progress updates
+            total_tasks = len(tasks)
+            while not async_result.ready():
+                async_result.wait(timeout=1.0)
+                # Note: Can't get exact progress with starmap_async
             
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(_process_file_batch, args): i for i, args in enumerate(batch_args)}
-                
-                with tqdm(total=len(file_batches), desc="Processing batches", unit="batch") as pbar:
-                    for future in as_completed(futures):
-                        try:
-                            batch_docs = future.result()
-                            for doc in batch_docs:
-                                text_hash = hashlib.md5(doc["text"].encode()).hexdigest()
-                                if text_hash not in seen_hashes:
-                                    seen_hashes.add(text_hash)
-                                    doc["id"] = f"c4_{len(all_documents)}"
-                                    doc["source"] = "c4"
-                                    all_documents.append(doc)
-                            pbar.update(1)
-                            pbar.set_postfix({"docs": len(all_documents)})
-                        except Exception as e:
-                            logger.error(f"Batch processing error: {e}")
-        else:
-            # Few files: process individually
-            file_args = [
-                (f, self.config.min_text_length, self.config.max_text_length)
-                for f in json_files
-            ]
+            # Get results
+            logger.info("Collecting results from workers...")
+            results = async_result.get()
             
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(_process_single_json_file, args): args[0] for args in file_args}
-                
-                with tqdm(total=len(json_files), desc="Processing files", unit="file") as pbar:
-                    for future in as_completed(futures):
-                        file_path = futures[future]
-                        try:
-                            file_docs = future.result()
-                            for doc in file_docs:
-                                text_hash = hashlib.md5(doc["text"].encode()).hexdigest()
-                                if text_hash not in seen_hashes:
-                                    seen_hashes.add(text_hash)
-                                    doc["id"] = f"c4_{len(all_documents)}"
-                                    doc["source"] = "c4"
-                                    all_documents.append(doc)
-                            processed_files += 1
-                            pbar.update(1)
-                            pbar.set_postfix({"docs": len(all_documents)})
-                        except Exception as e:
-                            logger.error(f"Error processing {file_path}: {e}")
+            # Process results with progress bar
+            for file_docs in tqdm(results, desc="Merging results", total=len(results)):
+                for doc in file_docs:
+                    text_hash = hashlib.md5(doc["text"].encode()).hexdigest()
+                    if text_hash not in seen_hashes:
+                        seen_hashes.add(text_hash)
+                        doc["id"] = f"c4_{len(all_documents)}"
+                        doc["source"] = "c4"
+                        all_documents.append(doc)
         
         elapsed = time.time() - start_time
         docs_per_sec = len(all_documents) / elapsed if elapsed > 0 else 0
         mb_per_sec = (total_size / (1024**2)) / elapsed if elapsed > 0 else 0
         
-        logger.info(f"Successfully loaded {len(all_documents)} unique C4 documents")
+        logger.info(f"Successfully loaded {len(all_documents)} unique documents")
         logger.info(f"Processing time: {elapsed:.2f}s ({docs_per_sec:.0f} docs/s, {mb_per_sec:.1f} MB/s)")
         
         return all_documents
@@ -318,3 +283,13 @@ def create_dataset_manager(corpus_local_dir=None, cache_dir=None, num_workers=No
     config_kwargs.update(kwargs)
     config = DatasetConfig(**config_kwargs)
     return DatasetManager(config)
+
+
+# For testing multiprocessing
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        test_dir = sys.argv[1]
+        manager = create_dataset_manager(corpus_local_dir=test_dir, num_workers=4)
+        docs = manager.load_corpus()
+        print(f"Loaded {len(docs)} documents")

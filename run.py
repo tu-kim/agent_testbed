@@ -101,16 +101,13 @@ def run_index(args):
     from src.retrieval.dataset_loader import create_dataset_manager
     
     logger.info(f"Creating retriever with algorithm: {args.algorithm}")
-    logger.info(f"Tiered storage: {'enabled' if args.tiered else 'disabled'}")
-    if args.tiered:
-        logger.info(f"RAM capacity: {args.ram_capacity}, SSD dir: {args.ssd_dir}")
+    logger.info(f"Device: {args.device}, Batch size: {args.batch_size}")
     
     retriever = create_retriever(
         algorithm=args.algorithm,
         cache_dir=args.cache_dir,
-        tiered=args.tiered,
-        ram_capacity=args.ram_capacity,
-        ssd_dir=args.ssd_dir
+        batch_size=args.batch_size,
+        device=args.device
     )
     
     # Try to load existing index
@@ -126,7 +123,10 @@ def run_index(args):
         sys.exit(1)
     
     logger.info(f"Loading C4 corpus from: {args.corpus_dir}")
-    manager = create_dataset_manager(corpus_local_dir=args.corpus_dir)
+    manager = create_dataset_manager(
+        corpus_local_dir=args.corpus_dir,
+        num_workers=args.num_workers
+    )
     corpus = manager.load_corpus()
     
     if not corpus:
@@ -271,12 +271,12 @@ def main():
     index_parser.add_argument("--algorithm", type=str, default="hnsw", choices=["hnsw", "ivf", "flat"])
     index_parser.add_argument("--cache-dir", type=str, default="./cache/faiss_index")
     index_parser.add_argument("--force", action="store_true", help="Force rebuild index")
-    index_parser.add_argument("--tiered", action="store_true",
-                              help="Enable tiered storage (RAM + SSD)")
-    index_parser.add_argument("--ram-capacity", type=int, default=100000,
-                              help="Max vectors in RAM (hot tier) when tiered is enabled")
-    index_parser.add_argument("--ssd-dir", type=str, default="./cache/ssd_index",
-                              help="Directory for SSD-based cold tier")
+    index_parser.add_argument("--device", type=str, default="cuda", choices=["auto", "cuda", "cpu"],
+                              help="Device for embedding model (default: cuda)")
+    index_parser.add_argument("--batch-size", type=int, default=256,
+                              help="Batch size for encoding (default: 256)")
+    index_parser.add_argument("--num-workers", type=int, default=os.cpu_count() or 4,
+                              help="Number of parallel workers for loading JSON files")
     index_parser.set_defaults(func=run_index)
     
     # Profile command (HotpotQA questions)
