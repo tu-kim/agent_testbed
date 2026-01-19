@@ -1,0 +1,70 @@
+# Default configuration for Multi-hop RAG with IRCoT
+
+# vLLM Server Configuration
+vllm:
+  proxy:
+    host: "0.0.0.0"
+    port: 8000
+  prefill_workers:
+    - host: "localhost"
+      port: 8001
+  decode_workers:
+    - host: "localhost"
+      port: 8002
+  # Model can be HuggingFace ID or local directory path
+  model_name: "meta-llama/Llama-2-7b-chat-hf"
+  max_tokens: 512
+  temperature: 0.7
+  trust_remote_code: true
+
+# LLM REST Endpoint (for external vLLM server)
+llm_endpoint:
+  address: "http://localhost:8000"
+  model_name: "meta-llama/Llama-2-7b-chat-hf"
+
+# Retrieval Configuration
+retrieval:
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  cache_dir: "./cache/faiss_index"
+  top_k: 5
+  chunk_size: 512
+  chunk_overlap: 50
+
+# FAISS Index Configuration
+faiss:
+  # Options: "hnsw", "ivf"
+  algorithm: "hnsw"
+  # HNSW parameters
+  hnsw:
+    M: 32
+    ef_construction: 200
+    ef_search: 128
+  # IVF parameters
+  ivf:
+    nlist: 100
+    nprobe: 10
+
+# Dataset Configuration
+dataset:
+  corpus:
+    name: "allenai/c4"
+    subset: "en"
+    split: "train"
+    # local_dir: "/path/to/c4/data"  # Uncomment and set for local C4 data
+  qa:
+    name: "hotpotqa/hotpot_qa"
+    subset: "fullwiki"
+    split: "validation"
+    # local_dir: "/path/to/hotpotqa/data"  # Uncomment and set for local HotpotQA data
+
+# IRCoT Configuration
+ircot:
+  max_iterations: 3
+  retrieval_per_step: 3
+  early_stop: true
+
+# Frontend Profiling
+profiling:
+  num_queries: 10
+  warmup_queries: 2
+  log_detailed: true

@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent_testbed"
+version = "1.0.0"
+description = "Multi-hop RAG with IRCoT pipeline, vLLM distributed server, and FAISS vector DB"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Agent Runtime Team"}
+]
+keywords = ["rag", "llm", "vllm", "faiss", "langchain", "ircot"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "langchain>=0.1.0",
+    "langchain-community>=0.0.10",
+    "langchain-openai>=0.0.5",
+    "faiss-cpu>=1.7.4",
+    "sentence-transformers>=2.2.0",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "httpx>=0.26.0",
+    "datasets>=2.16.0",
+    "huggingface-hub>=0.20.0",
+    "pydantic>=2.5.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.66.0",
+    "aiohttp>=3.9.0",
+    "requests>=2.31.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+vllm = [
+    "vllm>=0.3.0",
+    "ray>=2.9.0",
+]
+
+[project.scripts]
+agent-testbed = "run:main"
+
+[project.urls]
+Homepage = "https://github.com/tu-kim/agent_testbed"
+Repository = "https://github.com/tu-kim/agent_testbed"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311"]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
