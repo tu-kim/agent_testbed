@@ -3,6 +3,8 @@ vLLM Decode Worker
 
 This worker handles the decode phase of the LLM inference,
 generating tokens autoregressively using the KV cache from prefill.
+
+Compatible with vLLM v0.14+ (V1 engine architecture).
 """
 
 import asyncio
@@ -19,13 +21,28 @@ from pydantic import BaseModel
 import uvicorn
 import httpx
 
+# vLLM v0.14+ uses V1 engine (AsyncLLM instead of AsyncLLMEngine)
 try:
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.engine.async_llm_engine import AsyncLLMEngine
-    VLLM_AVAILABLE = True
+    from vllm.sampling_params import RequestOutputKind
+    
+    # Try V1 engine first (vLLM v0.14+)
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM
+        VLLM_V1 = True
+        VLLM_AVAILABLE = True
+        logging.info("Using vLLM V1 engine (AsyncLLM)")
+    except ImportError:
+        # Fallback to legacy engine
+        from vllm.engine.async_llm_engine import AsyncLLMEngine as AsyncLLM
+        VLLM_V1 = False
+        VLLM_AVAILABLE = True
+        logging.info("Using vLLM legacy engine (AsyncLLMEngine)")
+        
 except ImportError:
     VLLM_AVAILABLE = False
+    VLLM_V1 = False
     logging.warning("vLLM not available. Running in mock mode.")
 
 
@@ -106,6 +123,7 @@ class DecodeWorkerConfig:
     dtype: str = "auto"
     trust_remote_code: bool = True
     tokenizer: Optional[str] = None  # Optional separate tokenizer path
+    enforce_eager: bool = False  # Set True for faster startup
 
 
 class DecodeWorker:
@@ -114,11 +132,13 @@ class DecodeWorker:
     
     Handles the decode phase which generates tokens autoregressively
     using KV cache from prefill workers.
+    
+    Compatible with vLLM v0.14+ (V1 engine).
     """
     
     def __init__(self, config: DecodeWorkerConfig):
         self.config = config
-        self.engine: Optional[AsyncLLMEngine] = None
+        self.engine: Optional[AsyncLLM] = None
         self.active_requests: Dict[str, Any] = {}
         self.http_client: Optional[httpx.AsyncClient] = None
         self.app = FastAPI(title="vLLM Decode Worker")
@@ -140,14 +160,19 @@ class DecodeWorker:
         
         @self.app.get("/health")
         async def health_check():
-            return {"status": "healthy", "worker_type": "decode"}
+            return {
+                "status": "healthy", 
+                "worker_type": "decode",
+                "vllm_version": "v1" if VLLM_V1 else "legacy"
+            }
         
         @self.app.get("/stats")
         async def get_stats():
             return {
                 "active_requests": len(self.active_requests),
                 "model_name": self.config.model_name,
-                "gpu_memory_utilization": self.config.gpu_memory_utilization
+                "gpu_memory_utilization": self.config.gpu_memory_utilization,
+                "vllm_v1_engine": VLLM_V1
             }
         
         @self.app.on_event("startup")
@@ -158,6 +183,7 @@ class DecodeWorker:
         async def shutdown():
             if self.http_client:
                 await self.http_client.aclose()
+            self.shutdown_engine()
     
     async def initialize(self):
         """Initialize the vLLM engine."""
@@ -180,14 +206,15 @@ class DecodeWorker:
                     "max_model_len": self.config.max_model_len,
                     "dtype": self.config.dtype,
                     "trust_remote_code": self.config.trust_remote_code,
+                    "enforce_eager": self.config.enforce_eager,
                 }
                 
                 if tokenizer_path:
                     engine_args_dict["tokenizer"] = tokenizer_path
                 
                 engine_args = AsyncEngineArgs(**engine_args_dict)
-                self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-                logger.info(f"Initialized vLLM engine with model: {model_path}")
+                self.engine = AsyncLLM.from_engine_args(engine_args)
+                logger.info(f"Initialized vLLM {'V1' if VLLM_V1 else 'legacy'} engine with model: {model_path}")
             except Exception as e:
                 logger.error(f"Failed to initialize vLLM engine: {e}")
                 raise
@@ -252,12 +279,16 @@ class DecodeWorker:
             
             if VLLM_AVAILABLE and self.engine is not None:
                 # Real vLLM decode
-                sampling_params = SamplingParams(
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    stop=request.stop_sequences,
-                )
+                sampling_params_kwargs = {
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "top_p": request.top_p,
+                }
+                
+                if request.stop_sequences:
+                    sampling_params_kwargs["stop"] = request.stop_sequences
+                
+                sampling_params = SamplingParams(**sampling_params_kwargs)
                 
                 # Generate unique internal request ID
                 internal_request_id = f"decode_{request.request_id}_{uuid.uuid4().hex[:8]}"
@@ -266,18 +297,23 @@ class DecodeWorker:
                 generated_tokens = 0
                 
                 try:
-                    # Use positional arguments as per vLLM documentation
-                    # generate(prompt, sampling_params, request_id, ...)
+                    # vLLM v0.14+ (V1 engine) API:
+                    # engine.generate(request_id=..., prompt=..., sampling_params=...)
                     results_generator = self.engine.generate(
-                        prompt,                   # positional: prompt
-                        sampling_params,          # positional: sampling_params
-                        internal_request_id       # positional: request_id
+                        request_id=internal_request_id,
+                        prompt=prompt,
+                        sampling_params=sampling_params
                     )
                     
                     async for result in results_generator:
                         if result.outputs:
                             generated_text = result.outputs[0].text
-                            generated_tokens = len(result.outputs[0].token_ids)
+                            if hasattr(result.outputs[0], 'token_ids'):
+                                generated_tokens = len(result.outputs[0].token_ids)
+                        
+                        # Check if finished
+                        if hasattr(result, 'finished') and result.finished:
+                            break
                             
                 except Exception as e:
                     logger.error(f"vLLM generate error: {e}", exc_info=True)
@@ -332,36 +368,62 @@ class DecodeWorker:
             prompt = kv_metadata.get("prompt", "")
             
             if VLLM_AVAILABLE and self.engine is not None:
-                sampling_params = SamplingParams(
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    stop=request.stop_sequences,
-                )
+                # Configure sampling params with DELTA output for streaming
+                sampling_params_kwargs = {
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "top_p": request.top_p,
+                }
+                
+                if request.stop_sequences:
+                    sampling_params_kwargs["stop"] = request.stop_sequences
+                
+                # For V1 engine, use DELTA output kind for streaming
+                if VLLM_V1:
+                    try:
+                        sampling_params_kwargs["output_kind"] = RequestOutputKind.DELTA
+                    except:
+                        pass  # output_kind not available in this version
+                
+                sampling_params = SamplingParams(**sampling_params_kwargs)
                 
                 # Generate unique internal request ID
                 internal_request_id = f"stream_{request.request_id}_{uuid.uuid4().hex[:8]}"
                 
                 try:
-                    # Use positional arguments as per vLLM documentation
+                    # vLLM v0.14+ (V1 engine) API
                     results_generator = self.engine.generate(
-                        prompt,                   # positional: prompt
-                        sampling_params,          # positional: sampling_params
-                        internal_request_id       # positional: request_id
+                        request_id=internal_request_id,
+                        prompt=prompt,
+                        sampling_params=sampling_params
                     )
                     
                     previous_text = ""
                     async for result in results_generator:
                         if result.outputs:
                             current_text = result.outputs[0].text
-                            new_text = current_text[len(previous_text):]
-                            previous_text = current_text
+                            
+                            # In DELTA mode, current_text is already the new text
+                            # In non-DELTA mode, we need to compute the diff
+                            if VLLM_V1:
+                                new_text = current_text  # DELTA mode
+                            else:
+                                new_text = current_text[len(previous_text):]
+                                previous_text = current_text
                             
                             if new_text:
                                 yield f"data: {new_text}\n\n"
-                            
+                        
+                        # Check if finished
+                        if hasattr(result, 'finished') and result.finished:
+                            yield f"data: [DONE]\n\n"
+                            break
+                        
+                        # Also check finish_reason in outputs
+                        if result.outputs and hasattr(result.outputs[0], 'finish_reason'):
                             if result.outputs[0].finish_reason:
                                 yield f"data: [DONE]\n\n"
+                                break
                                 
                 except Exception as e:
                     logger.error(f"Stream generate error: {e}", exc_info=True)
@@ -381,6 +443,16 @@ class DecodeWorker:
         except Exception as e:
             logger.error(f"Stream decode error: {e}", exc_info=True)
             yield f"data: [ERROR] {str(e)}\n\n"
+    
+    def shutdown_engine(self):
+        """Shutdown the engine gracefully."""
+        if self.engine is not None:
+            try:
+                if hasattr(self.engine, 'shutdown'):
+                    self.engine.shutdown()
+                logger.info("Engine shutdown complete")
+            except Exception as e:
+                logger.warning(f"Error during engine shutdown: {e}")
     
     def run(self):
         """Run the decode worker server."""
@@ -421,6 +493,8 @@ if __name__ == "__main__":
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
+    parser.add_argument("--enforce-eager", action="store_true", default=False,
+                        help="Enforce eager execution for faster startup")
     
     args = parser.parse_args()
     
@@ -431,9 +505,13 @@ if __name__ == "__main__":
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         trust_remote_code=args.trust_remote_code,
-        tokenizer=args.tokenizer
+        tokenizer=args.tokenizer,
+        enforce_eager=args.enforce_eager
     )
     
     # Initialize and run
     asyncio.run(worker.initialize())
-    worker.run()
+    try:
+        worker.run()
+    finally:
+        worker.shutdown_engine()

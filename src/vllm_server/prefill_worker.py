@@ -3,6 +3,8 @@ vLLM Prefill Worker
 
 This worker handles the prefill phase of the LLM inference,
 processing the input prompt and generating the initial KV cache.
+
+Compatible with vLLM v0.14+ (V1 engine architecture).
 """
 
 import asyncio
@@ -17,13 +19,28 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
+# vLLM v0.14+ uses V1 engine (AsyncLLM instead of AsyncLLMEngine)
 try:
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.engine.async_llm_engine import AsyncLLMEngine
-    VLLM_AVAILABLE = True
+    from vllm.sampling_params import RequestOutputKind
+    
+    # Try V1 engine first (vLLM v0.14+)
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM
+        VLLM_V1 = True
+        VLLM_AVAILABLE = True
+        logging.info("Using vLLM V1 engine (AsyncLLM)")
+    except ImportError:
+        # Fallback to legacy engine
+        from vllm.engine.async_llm_engine import AsyncLLMEngine as AsyncLLM
+        VLLM_V1 = False
+        VLLM_AVAILABLE = True
+        logging.info("Using vLLM legacy engine (AsyncLLMEngine)")
+        
 except ImportError:
     VLLM_AVAILABLE = False
+    VLLM_V1 = False
     logging.warning("vLLM not available. Running in mock mode.")
 
 
@@ -105,6 +122,7 @@ class PrefillWorkerConfig:
     dtype: str = "auto"
     trust_remote_code: bool = True
     tokenizer: Optional[str] = None  # Optional separate tokenizer path
+    enforce_eager: bool = False  # Set True for faster startup
 
 
 class PrefillWorker:
@@ -113,11 +131,13 @@ class PrefillWorker:
     
     Handles the prefill phase which processes input prompts
     and generates KV cache for decode workers.
+    
+    Compatible with vLLM v0.14+ (V1 engine).
     """
     
     def __init__(self, config: PrefillWorkerConfig):
         self.config = config
-        self.engine: Optional[AsyncLLMEngine] = None
+        self.engine: Optional[AsyncLLM] = None
         self.kv_cache_store: Dict[str, Any] = {}
         self.app = FastAPI(title="vLLM Prefill Worker")
         self._setup_routes()
@@ -139,14 +159,19 @@ class PrefillWorker:
         
         @self.app.get("/health")
         async def health_check():
-            return {"status": "healthy", "worker_type": "prefill"}
+            return {
+                "status": "healthy", 
+                "worker_type": "prefill",
+                "vllm_version": "v1" if VLLM_V1 else "legacy"
+            }
         
         @self.app.get("/stats")
         async def get_stats():
             return {
                 "active_kv_caches": len(self.kv_cache_store),
                 "model_name": self.config.model_name,
-                "gpu_memory_utilization": self.config.gpu_memory_utilization
+                "gpu_memory_utilization": self.config.gpu_memory_utilization,
+                "vllm_v1_engine": VLLM_V1
             }
     
     async def initialize(self):
@@ -170,14 +195,15 @@ class PrefillWorker:
                     "max_model_len": self.config.max_model_len,
                     "dtype": self.config.dtype,
                     "trust_remote_code": self.config.trust_remote_code,
+                    "enforce_eager": self.config.enforce_eager,
                 }
                 
                 if tokenizer_path:
                     engine_args_dict["tokenizer"] = tokenizer_path
                 
                 engine_args = AsyncEngineArgs(**engine_args_dict)
-                self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-                logger.info(f"Initialized vLLM engine with model: {model_path}")
+                self.engine = AsyncLLM.from_engine_args(engine_args)
+                logger.info(f"Initialized vLLM {'V1' if VLLM_V1 else 'legacy'} engine with model: {model_path}")
             except Exception as e:
                 logger.error(f"Failed to initialize vLLM engine: {e}")
                 raise
@@ -200,12 +226,23 @@ class PrefillWorker:
         try:
             if VLLM_AVAILABLE and self.engine is not None:
                 # Real vLLM prefill
-                sampling_params = SamplingParams(
-                    max_tokens=1,  # Only prefill, minimal decode
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    stop=request.stop_sequences,
-                )
+                sampling_params_kwargs = {
+                    "max_tokens": 1,  # Only prefill, minimal decode
+                    "temperature": request.temperature,
+                    "top_p": request.top_p,
+                }
+                
+                if request.stop_sequences:
+                    sampling_params_kwargs["stop"] = request.stop_sequences
+                
+                # For V1 engine, use DELTA output kind for streaming
+                if VLLM_V1:
+                    try:
+                        sampling_params_kwargs["output_kind"] = RequestOutputKind.DELTA
+                    except:
+                        pass  # output_kind not available in this version
+                
+                sampling_params = SamplingParams(**sampling_params_kwargs)
                 
                 # Generate a unique request ID for this prefill operation
                 internal_request_id = f"prefill_{request.request_id}_{uuid.uuid4().hex[:8]}"
@@ -213,12 +250,12 @@ class PrefillWorker:
                 prefill_tokens = 0
                 
                 try:
-                    # Use positional arguments as per vLLM documentation
-                    # generate(prompt, sampling_params, request_id, ...)
+                    # vLLM v0.14+ (V1 engine) API:
+                    # engine.generate(request_id=..., prompt=..., sampling_params=...)
                     results_generator = self.engine.generate(
-                        request.prompt,           # positional: prompt
-                        sampling_params,          # positional: sampling_params
-                        internal_request_id       # positional: request_id
+                        request_id=internal_request_id,
+                        prompt=request.prompt,
+                        sampling_params=sampling_params
                     )
                     
                     async for result in results_generator:
@@ -229,9 +266,14 @@ class PrefillWorker:
                             # Try to get from outputs
                             output = result.outputs[0]
                             if hasattr(output, 'token_ids'):
-                                # At least we processed something
                                 prefill_tokens = max(prefill_tokens, 1)
-                        break  # Only need first result for prefill
+                        
+                        # Check if finished
+                        if hasattr(result, 'finished') and result.finished:
+                            break
+                        
+                        # For prefill, we only need the first result
+                        break
                         
                 except Exception as e:
                     logger.error(f"vLLM generate error: {e}", exc_info=True)
@@ -295,6 +337,16 @@ class PrefillWorker:
             return {"status": "released", "kv_cache_id": kv_cache_id}
         return {"status": "not_found", "kv_cache_id": kv_cache_id}
     
+    def shutdown(self):
+        """Shutdown the engine gracefully."""
+        if self.engine is not None:
+            try:
+                if hasattr(self.engine, 'shutdown'):
+                    self.engine.shutdown()
+                logger.info("Engine shutdown complete")
+            except Exception as e:
+                logger.warning(f"Error during engine shutdown: {e}")
+    
     def run(self):
         """Run the prefill worker server."""
         uvicorn.run(
@@ -334,6 +386,8 @@ if __name__ == "__main__":
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
+    parser.add_argument("--enforce-eager", action="store_true", default=False,
+                        help="Enforce eager execution for faster startup")
     
     args = parser.parse_args()
     
@@ -344,9 +398,13 @@ if __name__ == "__main__":
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         trust_remote_code=args.trust_remote_code,
-        tokenizer=args.tokenizer
+        tokenizer=args.tokenizer,
+        enforce_eager=args.enforce_eager
     )
     
     # Initialize and run
     asyncio.run(worker.initialize())
-    worker.run()
+    try:
+        worker.run()
+    finally:
+        worker.shutdown()
