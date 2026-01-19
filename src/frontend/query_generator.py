@@ -41,6 +41,10 @@ class QueryResult:
     # Queue/wait time if available (in milliseconds)
     queue_time_ms: Optional[float] = None
     
+    # IRCoT metrics
+    num_iterations: int = 0
+    num_retrieved_docs: int = 0
+    
     # Metadata
     success: bool = True
     error_message: Optional[str] = None
@@ -74,6 +78,10 @@ class QPSStageResult:
     queue_time_p90: Optional[float] = None
     queue_time_p99: Optional[float] = None
     
+    # IRCoT metrics
+    avg_iterations: float = 0.0
+    avg_retrieved_docs: float = 0.0
+    
     # Throughput
     throughput_qps: float = 0.0
     success_rate: float = 1.0
@@ -105,6 +113,10 @@ class ProfilerConfig:
     
     # Concurrent request limit
     max_concurrent: int = 100
+    
+    # IRCoT settings
+    max_iterations: int = 3
+    top_k: int = 5
 
 
 class PoissonQueryGenerator:
@@ -117,6 +129,7 @@ class PoissonQueryGenerator:
     3. Measures total/retrieval/LLM latencies with P90/P99
     4. Tracks queue/wait time when available
     5. Reports throughput (queries per second)
+    6. Tracks average iterations and retrieved documents
     """
     
     def __init__(self, config: ProfilerConfig, questions: List[Dict[str, Any]]):
@@ -163,7 +176,9 @@ class PoissonQueryGenerator:
             async with self._semaphore:
                 payload = {
                     "question": question["question"],
-                    "query_id": query_id
+                    "query_id": query_id,
+                    "max_iterations": self.config.max_iterations,
+                    "top_k": self.config.top_k
                 }
                 
                 async with session.post(
@@ -185,6 +200,8 @@ class PoissonQueryGenerator:
                             total_time_ms=(end_time - submit_time) * 1000,
                             retrieval_time_ms=0,
                             llm_time_ms=0,
+                            num_iterations=0,
+                            num_retrieved_docs=0,
                             success=False,
                             error_message=f"HTTP {response.status}: {error_text[:100]}",
                             target_qps=target_qps
@@ -193,19 +210,8 @@ class PoissonQueryGenerator:
                     result_data = await response.json()
                     
                     # Extract latency breakdown from response
-                    # Expected response format:
-                    # {
-                    #   "answer": "...",
-                    #   "retrieval_time_ms": 123.45,
-                    #   "llm_time_ms": 456.78,
-                    #   "total_time_ms": 580.23,
-                    #   "server_start_time": 1234567890.123,  # optional
-                    #   "queue_time_ms": 10.5  # optional
-                    # }
-                    
                     retrieval_time_ms = result_data.get("retrieval_time_ms", 0)
                     llm_time_ms = result_data.get("llm_time_ms", 0)
-                    server_total_ms = result_data.get("total_time_ms", 0)
                     
                     # Calculate total time from client perspective
                     client_total_ms = (end_time - submit_time) * 1000
@@ -216,10 +222,13 @@ class PoissonQueryGenerator:
                     
                     # If server provides start time, calculate actual queue time
                     if server_start_time is not None and queue_time_ms is None:
-                        # Queue time = time between submit and server start processing
                         queue_time_ms = (server_start_time - submit_time) * 1000
                         if queue_time_ms < 0:
                             queue_time_ms = None  # Clock skew, ignore
+                    
+                    # Extract IRCoT metrics
+                    num_iterations = result_data.get("num_iterations", 0)
+                    num_retrieved_docs = result_data.get("num_retrieved_docs", 0)
                     
                     return QueryResult(
                         query_id=query_id,
@@ -232,6 +241,8 @@ class PoissonQueryGenerator:
                         retrieval_time_ms=retrieval_time_ms,
                         llm_time_ms=llm_time_ms,
                         queue_time_ms=queue_time_ms,
+                        num_iterations=num_iterations,
+                        num_retrieved_docs=num_retrieved_docs,
                         success=True,
                         target_qps=target_qps
                     )
@@ -248,6 +259,8 @@ class PoissonQueryGenerator:
                 total_time_ms=(end_time - submit_time) * 1000,
                 retrieval_time_ms=0,
                 llm_time_ms=0,
+                num_iterations=0,
+                num_retrieved_docs=0,
                 success=False,
                 error_message="Timeout",
                 target_qps=target_qps
@@ -264,6 +277,8 @@ class PoissonQueryGenerator:
                 total_time_ms=(end_time - submit_time) * 1000,
                 retrieval_time_ms=0,
                 llm_time_ms=0,
+                num_iterations=0,
+                num_retrieved_docs=0,
                 success=False,
                 error_message=str(e),
                 target_qps=target_qps
@@ -339,6 +354,7 @@ class PoissonQueryGenerator:
                 total_time_avg=0, total_time_p50=0, total_time_p90=0, total_time_p99=0,
                 retrieval_time_avg=0, retrieval_time_p90=0, retrieval_time_p99=0,
                 llm_time_avg=0, llm_time_p90=0, llm_time_p99=0,
+                avg_iterations=0, avg_retrieved_docs=0,
                 throughput_qps=0,
                 success_rate=0
             )
@@ -348,6 +364,10 @@ class PoissonQueryGenerator:
         retrieval_times = [r.retrieval_time_ms for r in successful]
         llm_times = [r.llm_time_ms for r in successful]
         queue_times = [r.queue_time_ms for r in successful if r.queue_time_ms is not None]
+        
+        # Extract IRCoT metrics
+        iterations = [r.num_iterations for r in successful]
+        retrieved_docs = [r.num_retrieved_docs for r in successful]
         
         # Calculate actual throughput
         if successful:
@@ -377,6 +397,9 @@ class PoissonQueryGenerator:
             llm_time_p90=self._compute_percentile(llm_times, 90),
             llm_time_p99=self._compute_percentile(llm_times, 99),
             
+            avg_iterations=np.mean(iterations) if iterations else 0,
+            avg_retrieved_docs=np.mean(retrieved_docs) if retrieved_docs else 0,
+            
             throughput_qps=throughput,
             success_rate=len(successful) / len(results) if results else 0
         )
@@ -399,7 +422,8 @@ class PoissonQueryGenerator:
                 session, question, f"warmup_{i}", self.config.warmup_qps
             )
             if result.success:
-                logger.info(f"Warmup {i+1}/{self.config.warmup_queries}: {result.total_time_ms:.1f}ms")
+                logger.info(f"Warmup {i+1}/{self.config.warmup_queries}: {result.total_time_ms:.1f}ms, "
+                           f"iterations={result.num_iterations}, docs={result.num_retrieved_docs}")
             else:
                 logger.warning(f"Warmup {i+1} failed: {result.error_message}")
             
@@ -454,6 +478,8 @@ class PoissonQueryGenerator:
         logger.info(f"{'='*60}")
         logger.info(f"  Queries: {stage.num_queries} (Success rate: {stage.success_rate*100:.1f}%)")
         logger.info(f"  Throughput: {stage.throughput_qps:.2f} QPS")
+        logger.info(f"  Avg Iterations: {stage.avg_iterations:.2f}")
+        logger.info(f"  Avg Retrieved Docs: {stage.avg_retrieved_docs:.2f}")
         logger.info(f"  Total Time:     Avg={stage.total_time_avg:.1f}ms, P90={stage.total_time_p90:.1f}ms, P99={stage.total_time_p99:.1f}ms")
         logger.info(f"  Retrieval Time: Avg={stage.retrieval_time_avg:.1f}ms, P90={stage.retrieval_time_p90:.1f}ms, P99={stage.retrieval_time_p99:.1f}ms")
         logger.info(f"  LLM Time:       Avg={stage.llm_time_avg:.1f}ms, P90={stage.llm_time_p90:.1f}ms, P99={stage.llm_time_p99:.1f}ms")
@@ -469,6 +495,8 @@ class PoissonQueryGenerator:
         all_retrieval = [r.retrieval_time_ms for r in successful]
         all_llm = [r.llm_time_ms for r in successful]
         all_queue = [r.queue_time_ms for r in successful if r.queue_time_ms is not None]
+        all_iterations = [r.num_iterations for r in successful]
+        all_retrieved_docs = [r.num_retrieved_docs for r in successful]
         
         report = {
             "timestamp": datetime.now().isoformat(),
@@ -478,13 +506,17 @@ class PoissonQueryGenerator:
                 "end_qps": self.config.end_qps,
                 "qps_step": self.config.qps_step,
                 "stage_duration": self.config.stage_duration,
-                "seed": self.config.seed
+                "seed": self.config.seed,
+                "max_iterations": self.config.max_iterations,
+                "top_k": self.config.top_k
             },
             "summary": {
                 "total_queries": len(self.results),
                 "successful_queries": len(successful),
                 "success_rate": len(successful) / len(self.results) if self.results else 0,
-                "num_stages": len(self.stage_results)
+                "num_stages": len(self.stage_results),
+                "avg_iterations": np.mean(all_iterations) if all_iterations else 0,
+                "avg_retrieved_docs": np.mean(all_retrieved_docs) if all_retrieved_docs else 0
             },
             "overall_latency": {
                 "total_time": {
@@ -515,6 +547,8 @@ class PoissonQueryGenerator:
                     "throughput_qps": s.throughput_qps,
                     "num_queries": s.num_queries,
                     "success_rate": s.success_rate,
+                    "avg_iterations": s.avg_iterations,
+                    "avg_retrieved_docs": s.avg_retrieved_docs,
                     "total_time": {
                         "avg_ms": s.total_time_avg,
                         "p50_ms": s.total_time_p50,
@@ -562,11 +596,14 @@ def print_report(report: Dict[str, Any]):
     print(f"\nTimestamp: {report['timestamp']}")
     print(f"Endpoint: {report['config']['endpoint']}")
     print(f"QPS Range: {report['config']['start_qps']} -> {report['config']['end_qps']} (step: {report['config']['qps_step']})")
+    print(f"IRCoT Settings: max_iterations={report['config']['max_iterations']}, top_k={report['config']['top_k']}")
     
     summary = report['summary']
     print(f"\n--- Summary ---")
     print(f"Total Queries: {summary['total_queries']}")
     print(f"Successful: {summary['successful_queries']} ({summary['success_rate']*100:.1f}%)")
+    print(f"Avg Iterations: {summary['avg_iterations']:.2f}")
+    print(f"Avg Retrieved Docs: {summary['avg_retrieved_docs']:.2f}")
     
     overall = report['overall_latency']
     print(f"\n--- Overall Latency (ms) ---")
@@ -583,12 +620,13 @@ def print_report(report: Dict[str, Any]):
         print(f"{'Queue Time':<20} {qt['avg_ms']:>10.1f} {qt['p50_ms']:>10.1f} {qt['p90_ms']:>10.1f} {qt['p99_ms']:>10.1f}")
     
     print(f"\n--- Per-Stage Results ---")
-    print(f"{'QPS':>6} {'Throughput':>12} {'Queries':>8} {'Success':>8} {'Total P90':>12} {'Total P99':>12}")
-    print("-" * 70)
+    print(f"{'QPS':>6} {'Throughput':>10} {'Queries':>8} {'Success':>8} {'Avg Iter':>9} {'Avg Docs':>9} {'P90':>10} {'P99':>10}")
+    print("-" * 90)
     
     for stage in report['stages']:
-        print(f"{stage['target_qps']:>6.1f} {stage['throughput_qps']:>12.2f} {stage['num_queries']:>8} "
-              f"{stage['success_rate']*100:>7.1f}% {stage['total_time']['p90_ms']:>12.1f} {stage['total_time']['p99_ms']:>12.1f}")
+        print(f"{stage['target_qps']:>6.1f} {stage['throughput_qps']:>10.2f} {stage['num_queries']:>8} "
+              f"{stage['success_rate']*100:>7.1f}% {stage['avg_iterations']:>9.2f} {stage['avg_retrieved_docs']:>9.2f} "
+              f"{stage['total_time']['p90_ms']:>10.1f} {stage['total_time']['p99_ms']:>10.1f}")
     
     print("="*80)
 
@@ -601,7 +639,9 @@ async def run_profiling(
     qps_step: float = 1.0,
     stage_duration: float = 30.0,
     seed: int = 42,
-    output_file: Optional[str] = None
+    output_file: Optional[str] = None,
+    max_iterations: int = 3,
+    top_k: int = 5
 ) -> Dict[str, Any]:
     """
     Run profiling with the query generator.
@@ -615,6 +655,8 @@ async def run_profiling(
         stage_duration: Duration of each QPS stage in seconds.
         seed: Random seed for reproducibility.
         output_file: Optional file path to save JSON report.
+        max_iterations: Maximum IRCoT iterations per query.
+        top_k: Number of documents to retrieve per step.
     
     Returns:
         Profiling report dictionary.
@@ -625,7 +667,9 @@ async def run_profiling(
         end_qps=end_qps,
         qps_step=qps_step,
         stage_duration=stage_duration,
-        seed=seed
+        seed=seed,
+        max_iterations=max_iterations,
+        top_k=top_k
     )
     
     generator = PoissonQueryGenerator(config, questions)
@@ -645,6 +689,7 @@ async def run_profiling(
 
 if __name__ == "__main__":
     import argparse
+    import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     
@@ -661,6 +706,10 @@ if __name__ == "__main__":
                         help="QPS increment per stage")
     parser.add_argument("--stage-duration", type=float, default=30.0,
                         help="Duration of each QPS stage (seconds)")
+    parser.add_argument("--max-iterations", type=int, default=3,
+                        help="Maximum IRCoT iterations per query")
+    parser.add_argument("--top-k", type=int, default=5,
+                        help="Number of documents to retrieve per step")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--output", type=str, default=None,
@@ -689,5 +738,7 @@ if __name__ == "__main__":
         qps_step=args.qps_step,
         stage_duration=args.stage_duration,
         seed=args.seed,
-        output_file=args.output
+        output_file=args.output,
+        max_iterations=args.max_iterations,
+        top_k=args.top_k
     ))
