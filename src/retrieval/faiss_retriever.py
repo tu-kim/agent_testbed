@@ -24,6 +24,7 @@ except ImportError:
     FAISS_AVAILABLE = False
     logging.warning("FAISS not available. Install with: pip install faiss-cpu")
 
+import torch
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -115,8 +116,22 @@ class TieredFAISSRetriever:
     def _load_embedding_model(self):
         if self.embedding_model is None:
             logger.info(f"Loading embedding model: {self.config.embedding_model}")
-            device = "cuda" if faiss.get_num_gpus() > 0 else "cpu"
+            
+            # Use PyTorch to detect CUDA availability (more reliable than FAISS GPU check)
+            if torch.cuda.is_available():
+                device = "cuda"
+                logger.info(f"GPU detected: {torch.cuda.get_device_name(0)}")
+                logger.info(f"CUDA version: {torch.version.cuda}")
+            else:
+                device = "cpu"
+                logger.warning("No GPU detected, using CPU for embeddings")
+            
             self.embedding_model = SentenceTransformer(self.config.embedding_model, device=device)
+            
+            # Verify model is on the correct device
+            actual_device = str(next(self.embedding_model.parameters()).device)
+            logger.info(f"Embedding model loaded on device: {actual_device}")
+            
             self.dimension = self.embedding_model.get_sentence_embedding_dimension()
     
     def _create_index(self, num_vectors: int = 0) -> faiss.Index:
