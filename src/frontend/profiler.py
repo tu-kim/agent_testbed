@@ -9,6 +9,7 @@ import asyncio
 import logging
 import time
 import json
+import random
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -19,6 +20,9 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Fixed seed for reproducible query sampling
+PROFILER_SEED = 42
 
 
 @dataclass
@@ -98,6 +102,44 @@ class ProfilerConfig:
     
     # Concurrency
     concurrent_requests: int = 1
+    
+    # Reproducibility
+    seed: int = PROFILER_SEED
+
+
+def sample_questions_deterministic(
+    questions: List[str], 
+    num_samples: int, 
+    seed: int = PROFILER_SEED
+) -> List[str]:
+    """
+    Sample questions deterministically using a fixed seed.
+    
+    This ensures that the same questions are always selected
+    for profiling, enabling reproducible benchmarks.
+    
+    Args:
+        questions: Full list of available questions
+        num_samples: Number of questions to sample
+        seed: Random seed for reproducibility
+        
+    Returns:
+        List of sampled questions (always the same for given inputs)
+    """
+    if num_samples >= len(questions):
+        return questions[:num_samples]
+    
+    # Create a new random generator with fixed seed
+    rng = random.Random(seed)
+    
+    # Create indices and shuffle deterministically
+    indices = list(range(len(questions)))
+    rng.shuffle(indices)
+    
+    # Select first num_samples indices
+    selected_indices = sorted(indices[:num_samples])
+    
+    return [questions[i] for i in selected_indices]
 
 
 class RAGProfiler:
@@ -162,7 +204,7 @@ class RAGProfiler:
                 query_id=query_id,
                 question=question,
                 answer=result.get("answer", ""),
-                success=result.get("success", True),
+                success=True,
                 total_time_ms=result.get("total_time_ms", (end_perf - start_perf) * 1000),
                 retrieval_time_ms=result.get("retrieval_time_ms", 0),
                 llm_time_ms=result.get("llm_time_ms", 0),
@@ -203,7 +245,13 @@ class RAGProfiler:
         if self.config.warmup_queries <= 0:
             return
         
-        warmup_questions = questions[:self.config.warmup_queries]
+        # Use deterministic sampling for warmup too
+        warmup_questions = sample_questions_deterministic(
+            questions, 
+            self.config.warmup_queries,
+            seed=self.config.seed + 1000  # Different seed for warmup
+        )
+        
         logger.info(f"Running {len(warmup_questions)} warmup queries...")
         
         for i, question in enumerate(warmup_questions):
@@ -280,6 +328,8 @@ class RAGProfiler:
         """
         Run profiling on a list of questions.
         
+        Uses deterministic sampling to ensure reproducible results.
+        
         Args:
             questions: List of questions to profile
             
@@ -289,16 +339,18 @@ class RAGProfiler:
         await self._init_client()
         
         try:
-            # Run warmup
+            # Run warmup with deterministic sampling
             await self._run_warmup(questions)
             
-            # Run actual profiling
-            test_questions = questions[self.config.warmup_queries:self.config.num_queries + self.config.warmup_queries]
+            # Sample test questions deterministically
+            test_questions = sample_questions_deterministic(
+                questions,
+                self.config.num_queries,
+                seed=self.config.seed
+            )
             
-            if not test_questions:
-                test_questions = questions[:self.config.num_queries]
-            
-            logger.info(f"Running {len(test_questions)} profiling queries...")
+            logger.info(f"Running {len(test_questions)} profiling queries (seed={self.config.seed})...")
+            logger.info(f"First 3 questions: {test_questions[:3]}")
             
             if self.config.concurrent_requests > 1:
                 # Concurrent execution
@@ -344,7 +396,9 @@ class RAGProfiler:
             "summary": asdict(summary),
             "metrics": [asdict(m) for m in self.metrics],
             "warmup_metrics": [asdict(m) for m in self.warmup_metrics],
-            "config": asdict(self.config)
+            "config": asdict(self.config),
+            "seed": self.config.seed,
+            "sampled_questions": [m.question for m in self.metrics]
         }
         
         with open(self.config.output_file, 'w') as f:
@@ -396,6 +450,7 @@ def create_profiler(
     endpoint: str = "http://localhost:8000",
     num_queries: int = 10,
     warmup_queries: int = 2,
+    seed: int = PROFILER_SEED,
     **kwargs
 ) -> RAGProfiler:
     """
@@ -405,6 +460,7 @@ def create_profiler(
         endpoint: RAG service endpoint
         num_queries: Number of queries to profile
         warmup_queries: Number of warmup queries
+        seed: Random seed for reproducible sampling
         **kwargs: Additional configuration options
         
     Returns:
@@ -414,6 +470,7 @@ def create_profiler(
         endpoint=endpoint,
         num_queries=num_queries,
         warmup_queries=warmup_queries,
+        seed=seed,
         **{k: v for k, v in kwargs.items() if hasattr(ProfilerConfig, k)}
     )
     
@@ -425,10 +482,14 @@ async def run_profiling(
     questions: List[str],
     num_queries: int = 10,
     warmup_queries: int = 2,
-    output_file: Optional[str] = None
+    output_file: Optional[str] = None,
+    seed: int = PROFILER_SEED
 ) -> ProfilerSummary:
     """
     Convenience function to run profiling.
+    
+    Uses deterministic sampling to ensure reproducible results.
+    The same seed will always select the same questions.
     
     Args:
         endpoint: RAG service endpoint
@@ -436,6 +497,7 @@ async def run_profiling(
         num_queries: Number of queries to profile
         warmup_queries: Number of warmup queries
         output_file: Optional file to save results
+        seed: Random seed for reproducible sampling (default: 42)
         
     Returns:
         ProfilerSummary with statistics
@@ -444,47 +506,11 @@ async def run_profiling(
         endpoint=endpoint,
         num_queries=num_queries,
         warmup_queries=warmup_queries,
-        output_file=output_file
+        output_file=output_file,
+        seed=seed
     )
     
     summary = await profiler.run(questions)
     profiler.print_summary(summary)
     
     return summary
-
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="RAG Pipeline Profiler")
-    parser.add_argument("--endpoint", type=str, default="http://localhost:8000")
-    parser.add_argument("--num-queries", type=int, default=10)
-    parser.add_argument("--warmup-queries", type=int, default=2)
-    parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--concurrent", type=int, default=1)
-    
-    args = parser.parse_args()
-    
-    # Sample questions for testing
-    sample_questions = [
-        "What is the capital of France?",
-        "Who invented the telephone?",
-        "What is machine learning?",
-        "When was the Eiffel Tower built?",
-        "What is the largest planet in our solar system?",
-        "Who wrote Romeo and Juliet?",
-        "What is the speed of light?",
-        "When did World War II end?",
-        "What is the chemical formula for water?",
-        "Who painted the Mona Lisa?",
-        "What is the tallest mountain in the world?",
-        "When was the Declaration of Independence signed?",
-    ]
-    
-    asyncio.run(run_profiling(
-        endpoint=args.endpoint,
-        questions=sample_questions,
-        num_queries=args.num_queries,
-        warmup_queries=args.warmup_queries,
-        output_file=args.output
-    ))

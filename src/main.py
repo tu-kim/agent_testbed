@@ -23,7 +23,7 @@ if project_root not in sys.path:
 # Import components using absolute paths
 from src.retrieval.faiss_retriever import create_retriever
 from src.retrieval.dataset_loader import create_dataset_manager
-from src.rag_pipeline.ircot import IRCoTRAGPipeline, IRCoTConfig
+from src.rag_pipeline.ircot import IRCoTRAGPipeline, IRCoTConfig, IRCoTResult
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -110,8 +110,8 @@ async def query(request: QueryRequest):
     start_time = time.time()
     
     try:
-        # Run IRCoT pipeline
-        result = await state["pipeline"].arun(
+        # Run IRCoT pipeline - returns IRCoTResult dataclass
+        result: IRCoTResult = await state["pipeline"].arun(
             question=request.question,
             max_iterations=request.max_iterations,
             retrieval_per_step=request.top_k
@@ -119,20 +119,21 @@ async def query(request: QueryRequest):
         
         total_time = (time.time() - start_time) * 1000
         
+        # Access IRCoTResult using attribute access (not dictionary)
         return QueryResponse(
             question=request.question,
-            answer=result["answer"],
-            context=result["context"],
-            num_iterations=result["num_iterations"],
-            num_retrieved_docs=len(result["context"]),
-            total_time_ms=total_time,
-            retrieval_time_ms=result["profile"]["retrieval_time_ms"],
-            llm_time_ms=result["profile"]["llm_time_ms"],
-            reasoning_steps=result["steps"]
+            answer=result.answer,
+            context=result.context,
+            num_iterations=result.num_iterations,
+            num_retrieved_docs=len(result.context),
+            total_time_ms=result.total_time_ms,
+            retrieval_time_ms=result.retrieval_time_ms,
+            llm_time_ms=result.llm_time_ms,
+            reasoning_steps=result.steps
         )
         
     except Exception as e:
-        logger.error(f"Error processing query: {e}")
+        logger.error(f"Error processing query: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stats")

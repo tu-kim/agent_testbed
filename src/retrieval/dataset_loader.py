@@ -34,7 +34,7 @@ class DatasetConfig:
     
     # QA dataset (HotpotQA)
     qa_name: str = "hotpotqa/hotpot_qa"
-    qa_subset: str = "fullwiki"
+    qa_subset: str = "distractor"
     qa_split: str = "validation"
     
     # Processing options
@@ -223,9 +223,13 @@ class HotpotQALoader:
         self.config = config
     
     def load(self, max_samples: Optional[int] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        logger.info(f"Loading HotpotQA: {self.config.qa_name}")
-        dataset = load_dataset(self.config.qa_name, self.config.qa_subset, 
-                               split=self.config.qa_split, trust_remote_code=True)
+        logger.info(f"Loading HotpotQA: {self.config.qa_name} (subset: {self.config.qa_subset})")
+        dataset = load_dataset(
+            self.config.qa_name, 
+            name=self.config.qa_subset, 
+            split=self.config.qa_split, 
+            trust_remote_code=True
+        )
         
         questions = []
         supporting_docs = []
