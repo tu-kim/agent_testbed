@@ -3,6 +3,8 @@ Query Generator for RAG Pipeline Profiling
 
 Generates queries following a Poisson arrival process with gradually increasing QPS.
 Profiles total time, retrieval time, LLM time, P90/P99 latencies, and throughput.
+
+Key feature: Each QPS stage uses non-overlapping questions from the dataset.
 """
 
 import asyncio
@@ -130,20 +132,30 @@ class PoissonQueryGenerator:
     4. Tracks queue/wait time when available
     5. Reports throughput (queries per second)
     6. Tracks average iterations and retrieved documents
+    7. Uses non-overlapping questions across QPS stages
     """
     
     def __init__(self, config: ProfilerConfig, questions: List[Dict[str, Any]]):
         self.config = config
-        self.questions = questions
+        self.original_questions = questions.copy()
         self.results: List[QueryResult] = []
         self.stage_results: List[QPSStageResult] = []
         
         # Set random seed for reproducibility
-        random.seed(config.seed)
-        np.random.seed(config.seed)
+        self._rng = random.Random(config.seed)
+        self._np_rng = np.random.default_rng(config.seed)
+        
+        # Shuffle questions once with fixed seed for deterministic ordering
+        self.shuffled_questions = questions.copy()
+        self._rng.shuffle(self.shuffled_questions)
+        
+        # Track current position in the question list
+        self._question_offset = 0
         
         # Semaphore for concurrent request limiting
         self._semaphore: Optional[asyncio.Semaphore] = None
+        
+        logger.info(f"Initialized with {len(self.shuffled_questions)} questions (shuffled with seed={config.seed})")
         
     def _get_poisson_interval(self, qps: float) -> float:
         """
@@ -154,11 +166,40 @@ class PoissonQueryGenerator:
         """
         if qps <= 0:
             return 1.0
-        return np.random.exponential(1.0 / qps)
+        return self._np_rng.exponential(1.0 / qps)
     
-    def _sample_question(self) -> Dict[str, Any]:
-        """Sample a random question from the dataset."""
-        return random.choice(self.questions)
+    def _get_next_question(self) -> Dict[str, Any]:
+        """
+        Get the next question from the shuffled list.
+        
+        Uses sequential access to ensure no duplicates across stages.
+        Wraps around if all questions are exhausted.
+        """
+        if self._question_offset >= len(self.shuffled_questions):
+            # Wrap around if we've used all questions
+            logger.warning(f"All {len(self.shuffled_questions)} questions used. Wrapping around.")
+            self._question_offset = 0
+        
+        question = self.shuffled_questions[self._question_offset]
+        self._question_offset += 1
+        return question
+    
+    def _estimate_queries_needed(self) -> int:
+        """
+        Estimate total number of queries needed for all stages.
+        """
+        qps_values = np.arange(
+            self.config.start_qps,
+            self.config.end_qps + self.config.qps_step,
+            self.config.qps_step
+        )
+        
+        total_queries = 0
+        for qps in qps_values:
+            # Estimate queries per stage (QPS * duration)
+            total_queries += int(qps * self.config.stage_duration) + 10  # +10 buffer
+        
+        return total_queries
     
     async def _send_query(
         self, 
@@ -288,12 +329,17 @@ class PoissonQueryGenerator:
         self,
         session: aiohttp.ClientSession,
         target_qps: float,
-        duration: float
+        duration: float,
+        stage_index: int
     ) -> List[QueryResult]:
         """
         Run a single QPS stage with Poisson arrivals.
+        
+        Uses sequential questions from the shuffled list (no duplicates across stages).
         """
-        logger.info(f"Starting QPS stage: target={target_qps:.1f} QPS, duration={duration:.0f}s")
+        start_offset = self._question_offset
+        logger.info(f"Starting QPS stage {stage_index}: target={target_qps:.1f} QPS, duration={duration:.0f}s, "
+                   f"question offset={start_offset}")
         
         stage_results = []
         tasks = []
@@ -301,9 +347,9 @@ class PoissonQueryGenerator:
         query_count = 0
         
         while time.time() - stage_start < duration:
-            # Sample question and generate query ID
-            question = self._sample_question()
-            query_id = f"q_{target_qps:.1f}_{query_count}"
+            # Get next question (sequential, no duplicates)
+            question = self._get_next_question()
+            query_id = f"q_s{stage_index}_qps{target_qps:.1f}_{query_count}"
             
             # Create async task for query
             task = asyncio.create_task(
@@ -325,7 +371,9 @@ class PoissonQueryGenerator:
                 elif isinstance(result, Exception):
                     logger.warning(f"Query failed with exception: {result}")
         
-        logger.info(f"QPS stage complete: sent {query_count} queries, received {len(stage_results)} results")
+        end_offset = self._question_offset
+        logger.info(f"QPS stage {stage_index} complete: sent {query_count} queries, received {len(stage_results)} results, "
+                   f"used questions [{start_offset}:{end_offset}]")
         return stage_results
     
     def _compute_percentile(self, values: List[float], percentile: float) -> float:
@@ -413,11 +461,11 @@ class PoissonQueryGenerator:
         return stage_result
     
     async def _warmup(self, session: aiohttp.ClientSession):
-        """Run warmup queries."""
+        """Run warmup queries (uses separate questions that won't be reused)."""
         logger.info(f"Running {self.config.warmup_queries} warmup queries...")
         
         for i in range(self.config.warmup_queries):
-            question = self._sample_question()
+            question = self._get_next_question()
             result = await self._send_query(
                 session, question, f"warmup_{i}", self.config.warmup_qps
             )
@@ -429,7 +477,7 @@ class PoissonQueryGenerator:
             
             await asyncio.sleep(1.0 / self.config.warmup_qps)
         
-        logger.info("Warmup complete")
+        logger.info(f"Warmup complete. Question offset now at {self._question_offset}")
     
     async def run(self) -> Dict[str, Any]:
         """
@@ -439,6 +487,15 @@ class PoissonQueryGenerator:
             Dictionary containing all profiling results.
         """
         self._semaphore = asyncio.Semaphore(self.config.max_concurrent)
+        
+        # Estimate and log queries needed
+        estimated_queries = self._estimate_queries_needed()
+        logger.info(f"Estimated queries needed: {estimated_queries}")
+        logger.info(f"Available questions: {len(self.shuffled_questions)}")
+        
+        if estimated_queries > len(self.shuffled_questions):
+            logger.warning(f"Not enough unique questions! May need to wrap around. "
+                          f"Need ~{estimated_queries}, have {len(self.shuffled_questions)}")
         
         async with aiohttp.ClientSession() as session:
             # Warmup
@@ -454,9 +511,9 @@ class PoissonQueryGenerator:
             logger.info(f"Running {len(qps_values)} QPS stages: {qps_values.tolist()}")
             
             # Run each QPS stage
-            for target_qps in qps_values:
+            for stage_idx, target_qps in enumerate(qps_values):
                 stage_results = await self._run_qps_stage(
-                    session, target_qps, self.config.stage_duration
+                    session, target_qps, self.config.stage_duration, stage_idx
                 )
                 self.results.extend(stage_results)
                 
@@ -515,6 +572,7 @@ class PoissonQueryGenerator:
                 "successful_queries": len(successful),
                 "success_rate": len(successful) / len(self.results) if self.results else 0,
                 "num_stages": len(self.stage_results),
+                "total_unique_questions_used": self._question_offset,
                 "avg_iterations": np.mean(all_iterations) if all_iterations else 0,
                 "avg_retrieved_docs": np.mean(all_retrieved_docs) if all_retrieved_docs else 0
             },
@@ -602,6 +660,7 @@ def print_report(report: Dict[str, Any]):
     print(f"\n--- Summary ---")
     print(f"Total Queries: {summary['total_queries']}")
     print(f"Successful: {summary['successful_queries']} ({summary['success_rate']*100:.1f}%)")
+    print(f"Unique Questions Used: {summary.get('total_unique_questions_used', 'N/A')}")
     print(f"Avg Iterations: {summary['avg_iterations']:.2f}")
     print(f"Avg Retrieved Docs: {summary['avg_retrieved_docs']:.2f}")
     
