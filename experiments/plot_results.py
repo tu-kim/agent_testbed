@@ -86,45 +86,100 @@ def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float
     """
     Extract QPS levels and metrics from result JSON.
     
+    Expected JSON structure from query_generator.py:
+    {
+        "stages": [
+            {
+                "target_qps": 1.0,
+                "total_time": {"avg_ms": 100, "p50_ms": 90, "p90_ms": 150, "p99_ms": 200},
+                "retrieval_time": {"avg_ms": 20, "p90_ms": 30, "p99_ms": 40},
+                "llm_time": {"avg_ms": 70, "p90_ms": 100, "p99_ms": 150},
+                "queue_time": {"avg_ms": 10, "p90_ms": 20, "p99_ms": 30}  # or null
+            },
+            ...
+        ]
+    }
+    
     Returns:
         Tuple of (qps_list, metrics_dict)
-        metrics_dict contains: total_avg, total_p99, llm_avg, llm_p99, queue_avg, queue_p99
     """
     qps_list = []
     metrics = {
         'total_avg': [],
+        'total_p50': [],
+        'total_p90': [],
         'total_p99': [],
         'llm_avg': [],
+        'llm_p90': [],
         'llm_p99': [],
         'retrieval_avg': [],
+        'retrieval_p90': [],
         'retrieval_p99': [],
         'queue_avg': [],
+        'queue_p90': [],
         'queue_p99': [],
     }
     
-    # Handle different result formats
-    stages = results.get('stages', results.get('per_stage_results', []))
+    # Get stages list
+    stages = results.get('stages', [])
+    
+    if not stages:
+        print("Warning: No 'stages' found in JSON")
+        return qps_list, metrics
     
     for stage in stages:
         # QPS
-        qps = safe_float(stage.get('target_qps', stage.get('qps', 0)))
+        qps = safe_float(stage.get('target_qps', 0))
         qps_list.append(qps)
         
-        # Total latency
-        metrics['total_avg'].append(safe_float(stage.get('avg_total_time_ms', stage.get('total_time_avg', 0))))
-        metrics['total_p99'].append(safe_float(stage.get('p99_total_time_ms', stage.get('total_time_p99', 0))))
+        # Total latency (nested structure)
+        total_time = stage.get('total_time', {})
+        if isinstance(total_time, dict):
+            metrics['total_avg'].append(safe_float(total_time.get('avg_ms', 0)))
+            metrics['total_p50'].append(safe_float(total_time.get('p50_ms', 0)))
+            metrics['total_p90'].append(safe_float(total_time.get('p90_ms', 0)))
+            metrics['total_p99'].append(safe_float(total_time.get('p99_ms', 0)))
+        else:
+            metrics['total_avg'].append(0.0)
+            metrics['total_p50'].append(0.0)
+            metrics['total_p90'].append(0.0)
+            metrics['total_p99'].append(0.0)
         
-        # LLM latency
-        metrics['llm_avg'].append(safe_float(stage.get('avg_llm_time_ms', stage.get('llm_time_avg', 0))))
-        metrics['llm_p99'].append(safe_float(stage.get('p99_llm_time_ms', stage.get('llm_time_p99', 0))))
+        # LLM latency (nested structure)
+        llm_time = stage.get('llm_time', {})
+        if isinstance(llm_time, dict):
+            metrics['llm_avg'].append(safe_float(llm_time.get('avg_ms', 0)))
+            metrics['llm_p90'].append(safe_float(llm_time.get('p90_ms', 0)))
+            metrics['llm_p99'].append(safe_float(llm_time.get('p99_ms', 0)))
+        else:
+            metrics['llm_avg'].append(0.0)
+            metrics['llm_p90'].append(0.0)
+            metrics['llm_p99'].append(0.0)
         
-        # Retrieval latency
-        metrics['retrieval_avg'].append(safe_float(stage.get('avg_retrieval_time_ms', stage.get('retrieval_time_avg', 0))))
-        metrics['retrieval_p99'].append(safe_float(stage.get('p99_retrieval_time_ms', stage.get('retrieval_time_p99', 0))))
+        # Retrieval latency (nested structure)
+        retrieval_time = stage.get('retrieval_time', {})
+        if isinstance(retrieval_time, dict):
+            metrics['retrieval_avg'].append(safe_float(retrieval_time.get('avg_ms', 0)))
+            metrics['retrieval_p90'].append(safe_float(retrieval_time.get('p90_ms', 0)))
+            metrics['retrieval_p99'].append(safe_float(retrieval_time.get('p99_ms', 0)))
+        else:
+            metrics['retrieval_avg'].append(0.0)
+            metrics['retrieval_p90'].append(0.0)
+            metrics['retrieval_p99'].append(0.0)
         
-        # Queue time
-        metrics['queue_avg'].append(safe_float(stage.get('avg_queue_time_ms', stage.get('queue_time_avg', 0))))
-        metrics['queue_p99'].append(safe_float(stage.get('p99_queue_time_ms', stage.get('queue_time_p99', 0))))
+        # Queue time (nested structure, may be null)
+        queue_time = stage.get('queue_time')
+        if queue_time and isinstance(queue_time, dict):
+            metrics['queue_avg'].append(safe_float(queue_time.get('avg_ms', 0)))
+            metrics['queue_p90'].append(safe_float(queue_time.get('p90_ms', 0)))
+            metrics['queue_p99'].append(safe_float(queue_time.get('p99_ms', 0)))
+        else:
+            metrics['queue_avg'].append(0.0)
+            metrics['queue_p90'].append(0.0)
+            metrics['queue_p99'].append(0.0)
+    
+    print(f"  Parsed {len(qps_list)} stages, QPS range: {min(qps_list) if qps_list else 0:.1f} - {max(qps_list) if qps_list else 0:.1f}")
+    print(f"  Sample total_avg values: {metrics['total_avg'][:3]}...")
     
     return qps_list, metrics
 
@@ -388,9 +443,12 @@ def main():
         qps_list, metrics = extract_stage_data(exp1_data)
         print(f"Loaded {len(qps_list)} QPS stages: {qps_list}")
         
-        plot_exp1_total_latency_avg(qps_list, metrics, str(output_dir))
-        plot_exp1_total_latency_p99(qps_list, metrics, str(output_dir))
-        plot_exp1_queue_time_ratio(qps_list, metrics, str(output_dir))
+        if qps_list and any(v > 0 for v in metrics['total_avg']):
+            plot_exp1_total_latency_avg(qps_list, metrics, str(output_dir))
+            plot_exp1_total_latency_p99(qps_list, metrics, str(output_dir))
+            plot_exp1_queue_time_ratio(qps_list, metrics, str(output_dir))
+        else:
+            print("Warning: No valid data found in experiment 1 results")
     else:
         print(f"Skipping Experiment 1 graphs (file not found: {exp1_file})")
     
@@ -406,8 +464,11 @@ def main():
         
         if data:
             qps_list, metrics = extract_stage_data(data)
-            exp2_data[max_iter] = (qps_list, metrics)
-            print(f"Loaded max_iter={max_iter}: {len(qps_list)} QPS stages")
+            if qps_list and any(v > 0 for v in metrics['total_avg']):
+                exp2_data[max_iter] = (qps_list, metrics)
+                print(f"Loaded max_iter={max_iter}: {len(qps_list)} QPS stages")
+            else:
+                print(f"Warning: No valid data in max_iter={max_iter}")
         else:
             print(f"Skipping max_iter={max_iter} (file not found: {exp2_file})")
     
@@ -417,7 +478,7 @@ def main():
         plot_exp2_queue_time_ratio_comparison(exp2_data, str(output_dir))
         plot_exp2_latency_breakdown(exp2_data, str(output_dir))
     else:
-        print("Skipping Experiment 2 graphs (no data files found)")
+        print("Skipping Experiment 2 graphs (no valid data files found)")
     
     print("\n" + "=" * 60)
     print(f"All graphs saved to: {output_dir}")
