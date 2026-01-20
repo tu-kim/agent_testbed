@@ -8,8 +8,8 @@ Experiment 1: Fixed max_iterations=3, top_k=5, varying QPS
 Experiment 2: Varying max_iterations (1-5), fixed top_k=5, varying QPS
 
 Input files:
-- Experiment 1: ../results/exp_fixed_iter3_topk5.json
-- Experiment 2: ../results/exp_iter{1,2,3,4,5}_topk5.json
+- Experiment 1: ../results/exp1_fixed_iter3_topk5.json
+- Experiment 2: ../results/exp2_iter{1,2,3,4,5}_topk5.json
 
 Output:
 - Graphs saved to ../results/graphs/
@@ -129,7 +129,7 @@ def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float
     
     for stage in stages:
         # QPS
-        qps = safe_float(stage.get('target_qps', 0))
+        qps = safe_float(stage.get('target_qps', stage.get('qps', 0)))
         qps_list.append(qps)
         
         # Total latency (nested structure)
@@ -140,10 +140,11 @@ def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float
             metrics['total_p90'].append(safe_float(total_time.get('p90_ms', 0)))
             metrics['total_p99'].append(safe_float(total_time.get('p99_ms', 0)))
         else:
-            metrics['total_avg'].append(0.0)
-            metrics['total_p50'].append(0.0)
-            metrics['total_p90'].append(0.0)
-            metrics['total_p99'].append(0.0)
+            # Flat structure fallback
+            metrics['total_avg'].append(safe_float(stage.get('total_time_avg', stage.get('avg_total_time_ms', 0))))
+            metrics['total_p50'].append(safe_float(stage.get('total_time_p50', 0)))
+            metrics['total_p90'].append(safe_float(stage.get('total_time_p90', 0)))
+            metrics['total_p99'].append(safe_float(stage.get('total_time_p99', stage.get('p99_total_time_ms', 0))))
         
         # LLM latency (nested structure)
         llm_time = stage.get('llm_time', {})
@@ -152,9 +153,9 @@ def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float
             metrics['llm_p90'].append(safe_float(llm_time.get('p90_ms', 0)))
             metrics['llm_p99'].append(safe_float(llm_time.get('p99_ms', 0)))
         else:
-            metrics['llm_avg'].append(0.0)
-            metrics['llm_p90'].append(0.0)
-            metrics['llm_p99'].append(0.0)
+            metrics['llm_avg'].append(safe_float(stage.get('llm_time_avg', 0)))
+            metrics['llm_p90'].append(safe_float(stage.get('llm_time_p90', 0)))
+            metrics['llm_p99'].append(safe_float(stage.get('llm_time_p99', 0)))
         
         # Retrieval latency (nested structure)
         retrieval_time = stage.get('retrieval_time', {})
@@ -163,9 +164,9 @@ def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float
             metrics['retrieval_p90'].append(safe_float(retrieval_time.get('p90_ms', 0)))
             metrics['retrieval_p99'].append(safe_float(retrieval_time.get('p99_ms', 0)))
         else:
-            metrics['retrieval_avg'].append(0.0)
-            metrics['retrieval_p90'].append(0.0)
-            metrics['retrieval_p99'].append(0.0)
+            metrics['retrieval_avg'].append(safe_float(stage.get('retrieval_time_avg', 0)))
+            metrics['retrieval_p90'].append(safe_float(stage.get('retrieval_time_p90', 0)))
+            metrics['retrieval_p99'].append(safe_float(stage.get('retrieval_time_p99', 0)))
         
         # Queue time (nested structure, may be null)
         queue_time = stage.get('queue_time')
@@ -174,9 +175,9 @@ def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float
             metrics['queue_p90'].append(safe_float(queue_time.get('p90_ms', 0)))
             metrics['queue_p99'].append(safe_float(queue_time.get('p99_ms', 0)))
         else:
-            metrics['queue_avg'].append(0.0)
-            metrics['queue_p90'].append(0.0)
-            metrics['queue_p99'].append(0.0)
+            metrics['queue_avg'].append(safe_float(stage.get('queue_time_avg', 0)))
+            metrics['queue_p90'].append(safe_float(stage.get('queue_time_p90', 0)))
+            metrics['queue_p99'].append(safe_float(stage.get('queue_time_p99', 0)))
     
     print(f"  Parsed {len(qps_list)} stages, QPS range: {min(qps_list) if qps_list else 0:.1f} - {max(qps_list) if qps_list else 0:.1f}")
     print(f"  Sample total_avg values: {metrics['total_avg'][:3]}...")
@@ -436,7 +437,8 @@ def main():
     print("EXPERIMENT 1: Fixed max_iterations=3, top_k=5")
     print("=" * 60)
     
-    exp1_file = results_dir / 'exp_fixed_iter3_topk5.json'
+    # Updated filename: exp1_fixed_iter3_topk5.json
+    exp1_file = results_dir / 'exp1_fixed_iter3_topk5.json'
     exp1_data = load_json(str(exp1_file))
     
     if exp1_data:
@@ -459,7 +461,8 @@ def main():
     
     exp2_data = {}
     for max_iter in [1, 2, 3, 4, 5]:
-        exp2_file = results_dir / f'exp_iter{max_iter}_topk5.json'
+        # Updated filename: exp2_iter{N}_topk5.json
+        exp2_file = results_dir / f'exp2_iter{max_iter}_topk5.json'
         data = load_json(str(exp2_file))
         
         if data:
