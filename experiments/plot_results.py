@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -68,6 +69,19 @@ def load_json(filepath: str) -> Optional[Dict]:
         return None
 
 
+def safe_float(value, default=0.0) -> float:
+    """Convert value to float, handling None and NaN."""
+    if value is None:
+        return default
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (ValueError, TypeError):
+        return default
+
+
 def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float]]]:
     """
     Extract QPS levels and metrics from result JSON.
@@ -93,24 +107,24 @@ def extract_stage_data(results: Dict) -> Tuple[List[float], Dict[str, List[float
     
     for stage in stages:
         # QPS
-        qps = stage.get('target_qps', stage.get('qps', 0))
+        qps = safe_float(stage.get('target_qps', stage.get('qps', 0)))
         qps_list.append(qps)
         
         # Total latency
-        metrics['total_avg'].append(stage.get('avg_total_time_ms', stage.get('total_time_avg', 0)))
-        metrics['total_p99'].append(stage.get('p99_total_time_ms', stage.get('total_time_p99', 0)))
+        metrics['total_avg'].append(safe_float(stage.get('avg_total_time_ms', stage.get('total_time_avg', 0))))
+        metrics['total_p99'].append(safe_float(stage.get('p99_total_time_ms', stage.get('total_time_p99', 0))))
         
         # LLM latency
-        metrics['llm_avg'].append(stage.get('avg_llm_time_ms', stage.get('llm_time_avg', 0)))
-        metrics['llm_p99'].append(stage.get('p99_llm_time_ms', stage.get('llm_time_p99', 0)))
+        metrics['llm_avg'].append(safe_float(stage.get('avg_llm_time_ms', stage.get('llm_time_avg', 0))))
+        metrics['llm_p99'].append(safe_float(stage.get('p99_llm_time_ms', stage.get('llm_time_p99', 0))))
         
         # Retrieval latency
-        metrics['retrieval_avg'].append(stage.get('avg_retrieval_time_ms', stage.get('retrieval_time_avg', 0)))
-        metrics['retrieval_p99'].append(stage.get('p99_retrieval_time_ms', stage.get('retrieval_time_p99', 0)))
+        metrics['retrieval_avg'].append(safe_float(stage.get('avg_retrieval_time_ms', stage.get('retrieval_time_avg', 0))))
+        metrics['retrieval_p99'].append(safe_float(stage.get('p99_retrieval_time_ms', stage.get('retrieval_time_p99', 0))))
         
         # Queue time
-        metrics['queue_avg'].append(stage.get('avg_queue_time_ms', stage.get('queue_time_avg', 0)))
-        metrics['queue_p99'].append(stage.get('p99_queue_time_ms', stage.get('queue_time_p99', 0)))
+        metrics['queue_avg'].append(safe_float(stage.get('avg_queue_time_ms', stage.get('queue_time_avg', 0))))
+        metrics['queue_p99'].append(safe_float(stage.get('p99_queue_time_ms', stage.get('queue_time_p99', 0))))
     
     return qps_list, metrics
 
@@ -129,7 +143,8 @@ def plot_exp1_total_latency_avg(qps_list: List[float], metrics: Dict, output_dir
     
     # Add value labels
     for i, (x, y) in enumerate(zip(qps_list, metrics['total_avg'])):
-        ax.annotate(f'{y:.1f}', (x, y), textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9)
+        if y > 0:
+            ax.annotate(f'{y:.1f}', (x, y), textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9)
     
     plt.tight_layout()
     output_path = os.path.join(output_dir, 'exp1_total_latency_avg.png')
@@ -152,7 +167,8 @@ def plot_exp1_total_latency_p99(qps_list: List[float], metrics: Dict, output_dir
     
     # Add value labels
     for i, (x, y) in enumerate(zip(qps_list, metrics['total_p99'])):
-        ax.annotate(f'{y:.1f}', (x, y), textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9)
+        if y > 0:
+            ax.annotate(f'{y:.1f}', (x, y), textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9)
     
     plt.tight_layout()
     output_path = os.path.join(output_dir, 'exp1_total_latency_p99.png')
@@ -171,7 +187,7 @@ def plot_exp1_queue_time_ratio(qps_list: List[float], metrics: Dict, output_dir:
         if t_avg > 0:
             queue_ratio.append((q_avg / t_avg) * 100)
         else:
-            queue_ratio.append(0)
+            queue_ratio.append(0.0)
     
     bars = ax.bar(range(len(qps_list)), queue_ratio, color='#3498db', edgecolor='black', linewidth=0.5)
     
@@ -263,7 +279,7 @@ def plot_exp2_queue_time_ratio_comparison(all_data: Dict[int, Tuple], output_dir
             if t_avg > 0:
                 queue_ratio.append((q_avg / t_avg) * 100)
             else:
-                queue_ratio.append(0)
+                queue_ratio.append(0.0)
         
         offset = (i - num_iters / 2 + 0.5) * width
         bars = ax.bar(x + offset, queue_ratio, width, 
@@ -287,26 +303,49 @@ def plot_exp2_queue_time_ratio_comparison(all_data: Dict[int, Tuple], output_dir
 
 def plot_exp2_latency_breakdown(all_data: Dict[int, Tuple], output_dir: str):
     """Experiment 2: Latency breakdown (LLM, Retrieval, Queue) by max_iterations."""
-    fig, axes = plt.subplots(1, len(all_data), figsize=(4 * len(all_data), 6), sharey=True)
+    num_plots = len(all_data)
+    if num_plots == 0:
+        print("Warning: No data for latency breakdown plot")
+        return
     
-    if len(all_data) == 1:
+    fig, axes = plt.subplots(1, num_plots, figsize=(4 * num_plots, 6), sharey=True)
+    
+    if num_plots == 1:
         axes = [axes]
     
     for ax, (max_iter, (qps_list, metrics)) in zip(axes, sorted(all_data.items())):
         # Use last QPS stage for breakdown
         idx = -1  # Last stage
         
-        llm = metrics['llm_avg'][idx]
-        retrieval = metrics['retrieval_avg'][idx]
-        queue = metrics['queue_avg'][idx]
-        other = max(0, metrics['total_avg'][idx] - llm - retrieval - queue)
+        llm = safe_float(metrics['llm_avg'][idx] if metrics['llm_avg'] else 0)
+        retrieval = safe_float(metrics['retrieval_avg'][idx] if metrics['retrieval_avg'] else 0)
+        queue = safe_float(metrics['queue_avg'][idx] if metrics['queue_avg'] else 0)
+        total = safe_float(metrics['total_avg'][idx] if metrics['total_avg'] else 0)
+        other = max(0.0, total - llm - retrieval - queue)
         
         sizes = [llm, retrieval, queue, other]
+        
+        # Filter out zero values for pie chart
+        non_zero_sizes = []
+        non_zero_labels = []
+        non_zero_colors = []
         labels = ['LLM', 'Retrieval', 'Queue', 'Other']
         colors_pie = ['#3498db', '#2ecc71', '#e74c3c', '#95a5a6']
         
-        ax.pie(sizes, labels=labels, colors=colors_pie, autopct='%1.1f%%', startangle=90)
-        ax.set_title(f'max_iter={max_iter}\n(QPS={qps_list[idx]:.1f})', fontsize=11)
+        for size, label, color in zip(sizes, labels, colors_pie):
+            if size > 0:
+                non_zero_sizes.append(size)
+                non_zero_labels.append(label)
+                non_zero_colors.append(color)
+        
+        if non_zero_sizes:
+            ax.pie(non_zero_sizes, labels=non_zero_labels, colors=non_zero_colors, 
+                   autopct='%1.1f%%', startangle=90)
+        else:
+            ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=12)
+        
+        qps_val = safe_float(qps_list[idx] if qps_list else 0)
+        ax.set_title(f'max_iter={max_iter}\n(QPS={qps_val:.1f})', fontsize=11)
     
     fig.suptitle('Experiment 2: Latency Breakdown by max_iterations\n(at highest QPS)', fontsize=14, fontweight='bold')
     
